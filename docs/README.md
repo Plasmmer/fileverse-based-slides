@@ -6,6 +6,8 @@ The target is a browser-based editor that opens, edits, and exports real .pptx f
 
 ## Start here
 
+0. [DSlides first editor slice](SLIDES_MVP.md) — the isolated Slides entry point, initial authoring UI, local storage boundary, and current limitations.
+
 1. [Presentation editor plan](PRESENTATION_EDITOR_PLAN.md) — product boundaries, editor architecture, engine research, and technical decision gates.
 2. [PPTX compatibility plan](PPTX_COMPATIBILITY.md) — import/export pipeline, OOXML preservation, fidelity strategy, and test corpus.
 3. [Built-in Pijul version history](VERSIONING.md) — embedded repository format, OPC packaging, and external-editor compatibility.
@@ -34,6 +36,8 @@ The current repository still exposes DSheet:
 
 These are observations of the repository's current main branch, not claims about all deployed Fileverse services. See the linked source files in the plans below.
 
-## Scope of this documentation change
+## Current implementation status
 
-This plan does not add a slide editor, change the package API, or alter any backend. Implementation should proceed through the roadmap and preserve the spreadsheet path throughout.
+The first isolated DSlides editor slice now exists behind `@fileverse-dev/dsheet/slides`. It adds a versioned presentation model, a separate storage namespace/adapter, and an initial object-based authoring UI. The main DSheet entry point, workbook engine, spreadsheet schema, and existing collaboration identities remain unchanged.
+
+This is an early local-authoring foundation, not a completed presentation engine. PPTX import/export, embedded Pijul history, undo/redo, image editing, and Fileverse-hosted collaboration remain open work. In particular, the Fileverse app-type contract currently documents only `ddoc` and `dsheet`; DSlides must not claim a hosted session or reuse a `dsheet` room until the backend explicitly supports a separate presentation identity.
