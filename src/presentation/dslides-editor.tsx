@@ -3,6 +3,7 @@ import React, {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useRef,
   useState,
 } from 'react';
 import {
@@ -199,6 +200,18 @@ export const DSlidesEditor = forwardRef<
   const [hasEdited, setHasEdited] = useState(false);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('loading');
   const [storageError, setStorageError] = useState<string | null>(null);
+  const onSaveErrorRef = useRef(onSaveError);
+  const onDocumentChangeRef = useRef(onDocumentChange);
+
+  // Keep host callbacks fresh without restarting document loading on every
+  // parent render when the host passes inline callback functions.
+  useEffect(() => {
+    onSaveErrorRef.current = onSaveError;
+  }, [onSaveError]);
+
+  useEffect(() => {
+    onDocumentChangeRef.current = onDocumentChange;
+  }, [onDocumentChange]);
 
   useImperativeHandle(
     ref,
@@ -245,7 +258,7 @@ export const DSlidesEditor = forwardRef<
         setSelectedObjectId(null);
         setStorageError(normalizedError.message);
         setSaveStatus('error');
-        onSaveError?.(normalizedError);
+        onSaveErrorRef.current?.(normalizedError);
       } finally {
         if (active) setIsLoaded(true);
       }
@@ -255,7 +268,7 @@ export const DSlidesEditor = forwardRef<
     return () => {
       active = false;
     };
-  }, [presentationId, initialDocument, storage, onSaveError]);
+  }, [presentationId, initialDocument, storage]);
 
   const saveNow = useCallback(async () => {
     if (!storageReady) return;
@@ -269,9 +282,9 @@ export const DSlidesEditor = forwardRef<
       const normalizedError = errorFromUnknown(error);
       setStorageError(normalizedError.message);
       setSaveStatus('error');
-      onSaveError?.(normalizedError);
+      onSaveErrorRef.current?.(normalizedError);
     }
-  }, [document, onSaveError, storage, storageReady]);
+  }, [document, storage, storageReady]);
 
   // Debounced persistence avoids writing a full deck for every inspector keystroke.
   useEffect(() => {
@@ -285,8 +298,8 @@ export const DSlidesEditor = forwardRef<
   }, [document, hasEdited, isLoaded, saveNow, storageReady]);
 
   useEffect(() => {
-    if (isLoaded) onDocumentChange?.(document);
-  }, [document, isLoaded, onDocumentChange]);
+    if (isLoaded) onDocumentChangeRef.current?.(document);
+  }, [document, isLoaded]);
 
   const updateDocument = useCallback(
     (updater: (current: PresentationDocument) => PresentationDocument) => {

@@ -1,4 +1,5 @@
 import React from 'react';
+import './slides.css';
 import ReactDOM from 'react-dom/client';
 import { DSlidesEditor } from '../../src/slides';
 
