@@ -52,6 +52,9 @@ The phases are gates, not calendar estimates. Do not start the next phase merely
 - Support the first feature matrix and return an import report for unsupported constructs.
 - Preserve untouched OOXML parts when their relationships remain valid.
 - Add local autosave/recovery and explicit failure handling.
+- Spike libpijul on the intended runtime, including WASM compilation and a durable browser-backed filesystem; record a fallback decision if the required repository features cannot run locally.
+- Embed a portable .pijul repository as a registered OPC part inside the PPTX, excluding the history part and its wrapper relationship/content-type entries from the tracked OOXML projection.
+- Add named version checkpoints, browse/compare, and safe restore from the embedded history.
 - Build automated round-trip tests using the fixture corpus.
 - Test files in PowerPoint and LibreOffice Impress, with Google Slides as an additional interoperability check.
 
@@ -63,6 +66,9 @@ The phases are gates, not calendar estimates. Do not start the next phase merely
 - Unsupported content is reported rather than silently discarded.
 - Large-file parsing runs outside the UI main thread.
 - A failed import/export never destroys the user's source file or local draft.
+- The deck remains valid when the Pijul history part is absent or unreadable.
+- PowerPoint opens an embedded-history deck without repair prompts; preservation of history after PowerPoint Save As is measured separately.
+- Pijul version creation and restore pass tests without recursive history packaging.
 
 ## P3 — Fileverse protocol and backend compatibility spike
 
@@ -88,6 +94,7 @@ The phases are gates, not calendar estimates. Do not start the next phase merely
 
 - Implement the Fileverse provider using the supported upstream protocol.
 - Integrate encrypted document updates, durable recovery, awareness/presence, metadata, and storage commits.
+- Ensure the complete PPTX, including its embedded Pijul repository, is protected by the same Fileverse encryption and access-control boundary.
 - Integrate presentation sharing and permissions with the correct app identity.
 - Handle disconnect/reconnect, access revocation, room rotation, and cleanup.
 - Verify production and preview deployments from Vercel origins.
@@ -127,6 +134,7 @@ Every phase must preserve these rules:
 - **No fake backend:** local IndexedDB must not be presented as Fileverse cloud storage.
 - **No false fidelity claims:** only advertise features covered by tests.
 - **No silent data loss:** warn when a file contains content that cannot safely be edited or preserved.
+- **History is optional to external editors:** unknown Pijul OPC metadata must never be required to render slides, and its removal must not damage ordinary PPTX content.
 - **No credential leakage:** private credentials never enter browser bundles or VITE_ environment variables.
 - **No dependency by assumption:** licenses, maintenance status, bundle size, and engine APIs must be checked before selection.
 - **No placeholder implementation:** remove or label controls that do not yet perform their advertised actions.

@@ -8,12 +8,14 @@ The target is a browser-based editor that opens, edits, and exports real .pptx f
 
 1. [Presentation editor plan](PRESENTATION_EDITOR_PLAN.md) — product boundaries, editor architecture, engine research, and technical decision gates.
 2. [PPTX compatibility plan](PPTX_COMPATIBILITY.md) — import/export pipeline, OOXML preservation, fidelity strategy, and test corpus.
-3. [Fileverse integration plan](FILEVERSE_INTEGRATION.md) — current repository behavior, Fileverse RTC protocol, hosted-backend decision, and compatibility rules.
-4. [Roadmap](ROADMAP.md) — phased implementation order and acceptance criteria.
+3. [Built-in Pijul version history](VERSIONING.md) — embedded repository format, OPC packaging, and external-editor compatibility.
+4. [Fileverse integration plan](FILEVERSE_INTEGRATION.md) — current repository behavior, Fileverse RTC protocol, hosted-backend decision, and compatibility rules.
+5. [Roadmap](ROADMAP.md) — phased implementation order and acceptance criteria.
 
 ## Decisions captured so far
 
 - **Native presentation editing:** slides are editable objects on a canvas, with a slide navigator, Office-style ribbon, properties inspector, notes, and presentation mode.
+- **Built-in version history:** use libpijul to embed version history inside the .pptx package, with an OPC extension designed to be ignorable by PowerPoint and other editors.
 - **PPTX is an interchange format:** the editor needs its own presentation model. A .pptx file is imported into that model and exported from it; the ZIP/XML package is not the live editing database.
 - **Separate domain from spreadsheets:** retain the existing DSheet component, workbook engine, spreadsheet data, public exports, and collaboration identifiers. Presentation documents need their own model, state, UI, and application identity.
 - **Reuse selectively:** shared shell components and proven Fileverse services may be adapted behind clear interfaces. Workbook-specific UI and data structures must not become the slide engine.

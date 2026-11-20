@@ -78,6 +78,21 @@ Provide two explicit provider implementations:
 
 Do not expose a fake connected state when only IndexedDB has synchronized. Local persistence and remote collaboration need separate status labels.
 
+## Embedded Pijul history and Fileverse
+
+The presentation's libpijul history is part of the .pptx package, not a separate Fileverse collaboration database. See [VERSIONING.md](./VERSIONING.md) for its OPC packaging and PowerPoint compatibility rules.
+
+Keep the responsibilities separate:
+
+- Yjs/Fileverse RTC handles live collaborative updates and presence.
+- libpijul records durable, user-visible version checkpoints from a consistent presentation snapshot.
+- Fileverse storage/sharing must protect the complete .pptx, including the embedded history, under the same document access policy.
+- The collaboration server should not need to parse Pijul patches; it should transport and persist encrypted document state according to its existing protocol.
+
+Do not expose Pijul history to a collaborator who cannot access the deck. Do not send plaintext repository data to the collaboration server. Do not treat a Fileverse commit or server snapshot as automatically equivalent to a user-visible Pijul version.
+
+When a deck is updated in a live multi-user session, create a Pijul checkpoint only from a synchronized, stable Yjs state. Define who is allowed to create named versions and how author metadata is attributed; UCAN authentication is not automatically a Pijul patch signature.
+
 ## Hosted backend or our own server?
 
 | Situation | Frontend hosting | Collaboration/storage backend |
@@ -115,7 +130,8 @@ For a Vercel deployment:
 7. Do not send plaintext slide content to the collaboration server. Follow the Fileverse client-side encryption protocol.
 8. Treat server-reported permissions and document identity as authoritative; do not rely on frontend-only isAuthorized flags.
 9. Keep local-only, Fileverse-connected, and error states distinguishable.
-10. Add regression tests proving that a DSheet document opened by the old app remains a DSheet and that the presentation app rejects a DSheet room, and vice versa.
+10. Keep Pijul version history inside the PPTX file and under the same encryption/access-control boundary as the presentation.
+11. Add regression tests proving that a DSheet document opened by the old app remains a DSheet and that the presentation app rejects a DSheet room, and vice versa.
 
 ## Integration milestones
 
