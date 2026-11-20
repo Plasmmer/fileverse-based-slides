@@ -139,6 +139,8 @@ Every phase must preserve these rules:
 - **No dependency by assumption:** licenses, maintenance status, bundle size, and engine APIs must be checked before selection.
 - **No placeholder implementation:** remove or label controls that do not yet perform their advertised actions.
 
-## Current PR boundary
+## Current implementation boundary
 
-This PR adds planning documents only. It does not select a final engine, add presentation dependencies, implement PPTX parsing, change the DSheet component, or modify any Fileverse server. Those changes require the corresponding phase and its acceptance gate.
+The first DSlides UI slice is implemented behind a dedicated `./slides` package subpath. It introduces a small versioned presentation model, injectable storage adapter with a browser-local default, slide navigation, basic text/shape objects, a properties inspector, notes, and a simple presenter view.
+
+This does **not** close P0 or P1. The canvas is an initial isolated UI/model prototype, not the final selected engine. The engine comparison and PPTX fixture spike remain open; object dragging/resizing, undo/redo, images, import/export, and Pijul packaging are not implemented. No Fileverse backend or app-type contract is changed. The documented collaboration app types remain `ddoc` and `dsheet`; presentation collaboration must wait for a separately accepted identity and protocol.

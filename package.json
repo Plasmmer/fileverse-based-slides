@@ -1,7 +1,7 @@
 {
   "name": "@fileverse-dev/dsheet",
   "private": false,
-  "description": "DSheet",
+  "description": "Spreadsheet and presentation editor components for Fileverse.",
   "version": "4.1.27",
   "repository": {
     "type": "git",
@@ -29,6 +29,11 @@
       "import": "./dist/persistence.js",
       "types": "./dist/persistence.d.ts",
       "default": "./dist/persistence.js"
+    },
+    "./slides": {
+      "import": "./dist/slides.js",
+      "types": "./dist/slides.d.ts",
+      "default": "./dist/slides.js"
     },
     "./styles": "./dist/style.css",
     "./types": "./dist/editor/types.d.ts"

@@ -16,6 +16,21 @@
 <img width="1532" height="974" alt="dsheetsnew" src="https://github.com/user-attachments/assets/8bd67463-e999-41f4-b414-9d017fbf9466" />
 
 
+## Experimental Slides editor
+
+A separate presentation editor is available through the `/slides` package entry. This first slice is intentionally isolated from the spreadsheet API and currently provides local authoring for slides, text, and basic shapes. It is not yet a PPTX importer/exporter or a Fileverse-hosted collaboration client.
+
+```tsx
+import { DSlidesEditor } from '@fileverse-dev/dsheet/slides';
+import '@fileverse-dev/dsheet/styles';
+
+export function SlidesApp() {
+  return <DSlidesEditor presentationId="presentation-123" />;
+}
+```
+
+Hosts can provide a custom `PresentationStorageAdapter` and receive document snapshots through `onDocumentChange`. The built-in adapter stores drafts locally in a DSlides-only namespace. Do not pass a DSheet ID or reuse a DSheet collaboration room. See [the Slides implementation notes](docs/SLIDES_MVP.md).
+
 ## Installation
 
 Install via npm to get started:

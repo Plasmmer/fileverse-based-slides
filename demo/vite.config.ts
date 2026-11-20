@@ -6,6 +6,14 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd())
   return {
     plugins: [react()],
+    build: {
+      rollupOptions: {
+        input: {
+          main: path.resolve(__dirname, 'index.html'),
+          slides: path.resolve(__dirname, 'slides.html'),
+        },
+      },
+    },
     server: {
       fs: {
         allow: ['..'],
