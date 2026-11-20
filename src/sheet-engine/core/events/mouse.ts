@@ -1,6 +1,10 @@
 import _ from 'lodash';
 import { Freezen } from '..';
-import { Context, getFlowdata } from '../context';
+import {
+  Context,
+  getFlowdata,
+  updateContextWithSheetData,
+} from '../context';
 import {
   cancelActiveImgItem,
   cancelPaintModel,
@@ -18,8 +22,8 @@ import {
   onImageMoveEnd,
   onImageResize,
   onImageResizeEnd,
+  getCommentBoxByRC,
   removeEditingComment,
-  // overShowComment,
   removeOverShowComment,
   rangeDrag,
   onFormulaRangeDragEnd,
@@ -57,6 +61,7 @@ import {
 } from '../modules/protection';
 import {
   normalizeSelection,
+  seletedHighlistByindex,
   syncPrimaryCellActiveFromSelection,
   pasteHandlerOfPaintModel,
 } from '../modules/selection';
@@ -68,6 +73,7 @@ import {
   handleFormulaInput,
   rangeDragColumn,
   rangeDragRow,
+  resetFormulaArrowSession,
 } from '../modules/formula';
 import {
   showLinkCard,
@@ -90,7 +96,8 @@ export function handleGlobalWheel(
   scrollbarX: HTMLDivElement,
   scrollbarY: HTMLDivElement,
 ) {
-  removeEditingComment(ctx, cache);
+  // Do NOT clear editingCommentBox on wheel scroll — the pinned popup
+  // should survive scrolling and only close on click-elsewhere or Escape.
   if (cache.searchDialog?.mouseEnter && ctx.showSearch && ctx.showReplace)
     return;
   if (ctx.filterContextMenu != null) return;
@@ -287,6 +294,12 @@ export function handleCellAreaMouseDown(
     [col_pre, col, col_index, col_index_ed] = margeset.column;
   }
 
+  // Pin the comment popup when clicking a cell that has a comment.
+  // Runs before any canOpenEditor guard so it works in read-only / viewer mode.
+  if (flowdata[row_index]?.[col_index]?.ps) {
+    ctx.editingCommentBox = getCommentBoxByRC(ctx, flowdata, row_index, col_index);
+  }
+
   showLinkCard(ctx, row_index, col_index, undefined, false, true);
   // //单元格单击之前
   if (
@@ -374,6 +387,7 @@ export function handleCellAreaMouseDown(
       target?.id === 'luckysheet-functionbox-cell';
     if (!clickedInEditor) {
       ctx.luckysheetCellUpdate = [];
+      resetFormulaArrowSession(ctx);
       globalCache.enteredEditByTyping = false;
       delete globalCache.pendingTypeOverCell;
     }
@@ -2500,6 +2514,8 @@ export function mouseRender(
       scrollX.scrollLeft -
       window.scrollX;
     if (x < rect.width + ctx.scrollLeft - 100) {
+      // Match mouseup commit (`x + 3`); stored on globalCache to avoid Immer churn.
+      globalCache.colResizeLiveRightPx = x + 3;
       const changeSizeLine = container.querySelector(
         '.fortune-change-size-line',
       );
@@ -2522,6 +2538,8 @@ export function mouseRender(
       scrollY.scrollTop -
       window.scrollY;
     if (y < rect.height + ctx.scrollTop - 20) {
+      // Match mouseup commit (`y + 3`); stored on globalCache to avoid Immer churn.
+      globalCache.rowResizeLiveBottomPx = y + 3;
       const changeSizeLine = container.querySelector(
         '.fortune-change-size-line',
       );
@@ -3558,8 +3576,28 @@ export function handleOverlayMouseMove(
   const col_index = col_location[2];
   // console.log('mousemove row_index:', row_index, 'col_index:', col_index);
 
-  // overShowComment(ctx, e, scrollX, scrollY, container); // 有批注显示
-  editComment(ctx, globalCache, row_index, col_index);
+  // Hover comment popup: use the already-computed row/col so coordinates always match.
+  // Keep the popup alive while the mouse is physically over its DOM element
+  // (the popup is positioned beside the cell, so the mouse briefly leaves the cell
+  // as it travels to the popup).
+  {
+    const fd = getFlowdata(ctx);
+    if (fd) {
+      const rc = `${row_index}_${col_index}`;
+      const hasComment = !!fd[row_index]?.[col_index]?.ps;
+      const hoveredPopupEl = ctx.hoveredCommentBox
+        ? document.getElementById(`comment-box-${ctx.hoveredCommentBox.rc}`)
+        : null;
+      const isOverHoveredPopup = hoveredPopupEl?.contains(e.target as Node) ?? false;
+      if (!isOverHoveredPopup) {
+        if (!hasComment || ctx.editingCommentBox?.rc === rc) {
+          ctx.hoveredCommentBox = undefined;
+        } else if (ctx.hoveredCommentBox?.rc !== rc) {
+          ctx.hoveredCommentBox = getCommentBoxByRC(ctx, fd, row_index, col_index);
+        }
+      }
+    }
+  }
   overShowError(ctx, e, scrollX, scrollY, container);
   onSearchDialogMove(globalCache, e);
   onRangeSelectionModalMove(globalCache, e);
@@ -4200,6 +4238,7 @@ export function handleOverlayMouseUp(
 
   // 改变行高
   if (ctx.luckysheet_rows_change_size) {
+    delete globalCache.rowResizeLiveBottomPx;
     ctx.luckysheet_rows_change_size = false;
 
     // $("#fortune-change-size-line").hide();
@@ -4286,6 +4325,11 @@ export function handleOverlayMouseUp(
     if (idx == null) return;
     ctx.luckysheetfile[idx].config = ctx.config;
 
+    const flowdataAfterRowResize = getFlowdata(ctx);
+    if (flowdataAfterRowResize) {
+      updateContextWithSheetData(ctx, flowdataAfterRowResize);
+    }
+
     // server.saveParam("cg", ctx.currentSheetId, cfg.rowlen, {
     //   k: "rowlen",
     // });
@@ -4301,6 +4345,7 @@ export function handleOverlayMouseUp(
 
   // 改变列宽
   if (ctx.luckysheet_cols_change_size) {
+    delete globalCache.colResizeLiveRightPx;
     ctx.luckysheet_cols_change_size = false;
 
     const { scrollLeft } = ctx;
@@ -4389,6 +4434,11 @@ export function handleOverlayMouseUp(
     const idx = getSheetIndex(ctx, ctx.currentSheetId);
     if (idx == null) return;
     ctx.luckysheetfile[idx].config = ctx.config;
+
+    const flowdataAfterColResize = getFlowdata(ctx);
+    if (flowdataAfterColResize) {
+      updateContextWithSheetData(ctx, flowdataAfterColResize);
+    }
 
     // server.saveParam("cg", ctx.currentSheetId, cfg.columnlen, {
     //   k: "columnlen",
@@ -4883,49 +4933,34 @@ export function handleRowHeaderMouseDown(
       const last = _.cloneDeep(
         ctx.luckysheet_select_save?.[ctx.luckysheet_select_save.length - 1],
       ); // 选区最后一个
-      if (
-        !last ||
-        _.isNil(last.top) ||
-        _.isNil(last.height) ||
-        _.isNil(last.row_focus)
-      ) {
-        return;
-      }
+      if (last) {
+        const anchor = last.row_focus ?? last.row?.[0] ?? row_index;
+        const rStart = Math.min(anchor, row_index);
+        const rEnd = Math.max(anchor, row_index);
+        const bounds = seletedHighlistByindex(ctx, rStart, rEnd, 0, col_index);
 
-      let _top = 0;
-      let _height = 0;
-      let _rowseleted = [];
-      if (last.top > row_pre) {
-        _top = row_pre;
-        _height = last.top + last.height - row_pre;
-
-        if (last.row[1] > last.row_focus) {
-          last.row[1] = last.row_focus;
+        last.row = [rStart, rEnd];
+        last.column = [0, col_index];
+        if (bounds) {
+          last.left = bounds.left;
+          last.width = bounds.width;
+          last.top = bounds.top;
+          last.height = bounds.height;
+          last.left_move = bounds.left;
+          last.width_move = bounds.width;
+          last.top_move = bounds.top;
+          last.height_move = bounds.height;
+        }
+        last.row_select = true;
+        last.column_select = false;
+        last.column_focus = 0;
+        if (_.isNil(last.row_focus)) {
+          last.row_focus = anchor;
         }
 
-        _rowseleted = [row_index, last.row[1]];
-      } else if (last.top === row_pre) {
-        _top = row_pre;
-        _height = last.top + last.height - row_pre;
-        _rowseleted = [row_index, last.row[0]];
-      } else {
-        _top = last.top;
-        _height = row - last.top - 1;
-
-        if (last.row[0] < last.row_focus) {
-          last.row[0] = last.row_focus;
-        }
-
-        _rowseleted = [last.row[0], row_index];
+        ctx.luckysheet_select_save![ctx.luckysheet_select_save!.length - 1] =
+          last;
       }
-
-      last.row = _rowseleted;
-
-      last.top_move = _top;
-      last.height_move = _height;
-
-      ctx.luckysheet_select_save![ctx.luckysheet_select_save!.length - 1] =
-        last;
     } else if (e.ctrlKey || e.metaKey) {
       ctx.luckysheet_select_save?.push({
         left: colLocationByIndex(0, ctx.visibledatacolumn)[0],
@@ -5300,51 +5335,40 @@ export function handleColumnHeaderMouseDown(
       const last = _.cloneDeep(
         ctx.luckysheet_select_save?.[ctx.luckysheet_select_save.length - 1],
       ); // 选区最后一个
+      if (last) {
+        const anchor = last.column_focus ?? last.column?.[0] ?? col_index;
+        const cStart = Math.min(anchor, col_index);
+        const cEnd = Math.max(anchor, col_index);
+        const bounds = seletedHighlistByindex(
+          ctx,
+          0,
+          row_index,
+          cStart,
+          cEnd,
+        );
 
-      let _left = 0;
-      let _width = 0;
-      let _columnseleted = [];
-
-      if (
-        !last ||
-        _.isNil(last.left) ||
-        _.isNil(last.width) ||
-        _.isNil(last.column_focus)
-      ) {
-        return;
-      }
-
-      if (last.left > col_pre) {
-        _left = col_pre;
-        _width = last.left + last.width - col_pre;
-
-        if (last.column[1] > last.column_focus) {
-          last.column[1] = last.column_focus;
+        last.column = [cStart, cEnd];
+        last.row = [0, row_index];
+        if (bounds) {
+          last.left = bounds.left;
+          last.width = bounds.width;
+          last.top = bounds.top;
+          last.height = bounds.height;
+          last.left_move = bounds.left;
+          last.width_move = bounds.width;
+          last.top_move = bounds.top;
+          last.height_move = bounds.height;
+        }
+        last.column_select = true;
+        last.row_select = false;
+        last.row_focus = 0;
+        if (_.isNil(last.column_focus)) {
+          last.column_focus = anchor;
         }
 
-        _columnseleted = [col_index, last.column[1]];
-      } else if (last.left === col_pre) {
-        _left = col_pre;
-        _width = last.left + last.width - col_pre;
-        _columnseleted = [col_index, last.column[0]];
-      } else {
-        _left = last.left;
-        _width = col - last.left - 1;
-
-        if (last.column[0] < last.column_focus) {
-          last.column[0] = last.column_focus;
-        }
-
-        _columnseleted = [last.column[0], col_index];
+        ctx.luckysheet_select_save![ctx.luckysheet_select_save!.length - 1] =
+          last;
       }
-
-      last.column = _columnseleted;
-
-      last.left_move = _left;
-      last.width_move = _width;
-
-      ctx.luckysheet_select_save![ctx.luckysheet_select_save!.length - 1] =
-        last;
     } else if (e.ctrlKey || e.metaKey) {
       // 选区添加
       ctx.luckysheet_select_save?.push({
@@ -5423,7 +5447,7 @@ export function handleColSizeHandleMouseDown(
   cancelActiveImgItem(ctx, globalCache);
   // }
 
-  ctx.luckysheetCellUpdate = [];
+  // Keep in-cell edit open while resizing (do not clear luckysheetCellUpdate).
 
   // let mouse = mouseposition(event.pageX, event.pageY);
   const { scrollLeft } = ctx;
@@ -5439,8 +5463,10 @@ export function handleColSizeHandleMouseDown(
   const col = col_location[1];
   const col_index = col_location[2];
 
+  delete globalCache.colResizeLiveRightPx;
   ctx.luckysheet_cols_change_size = true;
   ctx.luckysheet_scroll_status = true;
+  globalCache.colResizeLiveRightPx = col;
   const changeSizeLine = workbookContainer.querySelector(
     '.fortune-change-size-line',
   );
@@ -5556,7 +5582,7 @@ export function handleRowSizeHandleMouseDown(
     israngeseleciton(ctx)
   )
     return;
-  ctx.luckysheetCellUpdate = [];
+  // Keep in-cell edit open while resizing (do not clear luckysheetCellUpdate).
 
   // let mouse = mouseposition(event.pageX, event.pageY);
   const { scrollLeft } = ctx;
@@ -5572,8 +5598,10 @@ export function handleRowSizeHandleMouseDown(
   const row = row_location[1];
   const row_index = row_location[2];
 
+  delete globalCache.rowResizeLiveBottomPx;
   ctx.luckysheet_rows_change_size = true;
   ctx.luckysheet_scroll_status = true;
+  globalCache.rowResizeLiveBottomPx = row;
   const changeSizeLine = workbookContainer.querySelector(
     '.fortune-change-size-line',
   );
@@ -5611,6 +5639,7 @@ export function handleColFreezeHandleMouseDown(
   cancelActiveImgItem(ctx, globalCache);
 
   ctx.luckysheetCellUpdate = [];
+  resetFormulaArrowSession(ctx);
 
   // let mouse = mouseposition(event.pageX, event.pageY);
   const { scrollLeft } = ctx;
@@ -5667,6 +5696,7 @@ export function handleRowFreezeHandleMouseDown(
   cancelActiveImgItem(ctx, globalCache);
 
   ctx.luckysheetCellUpdate = [];
+  resetFormulaArrowSession(ctx);
 
   // let mouse = mouseposition(event.pageX, event.pageY);
   const { scrollLeft } = ctx;

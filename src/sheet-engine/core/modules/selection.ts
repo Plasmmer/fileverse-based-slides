@@ -16,12 +16,16 @@ import {
   mergeBorder,
   mergeMoveMain,
   recalcAutoRowHeightForRow,
+  updateCell,
 } from './cell';
 import { isInlineStringCell } from './inline-string';
 import { delFunctionGroup } from './formula';
 import clipboard from './clipboard';
+import { clearImageClipboard } from './image-clipboard';
 import { getBorderInfoCompute } from './border';
-import { getComputeMap } from './ConditionFormat';
+import { checkCF, getComputeMap } from './ConditionFormat';
+import { clampIndicesToUsedBounds } from './copy-range-bounds';
+import { isClipboardMetadataRedundant } from '../utils/cell-persist-utils';
 import {
   escapeHTMLTag,
   getSheetIndex,
@@ -36,6 +40,10 @@ import { locale } from '../locale';
 import { CFSplitRange } from './ConditionFormat';
 import { clearCellError } from './error-state-helpers';
 import { scheduleSheetMetadataSyncHooks } from './sheet-metadata-hooks';
+import {
+  assignActiveConfigToSheetFile,
+  syncFormatOnlyRectIntoRanges,
+} from './sheet';
 
 export const selectionCache = {
   isPasteAction: false,
@@ -355,23 +363,24 @@ export function normalizeSelection(
   }
 
   for (let i = 0; i < selection.length; i += 1) {
-    const r1 = selection[i].row[0];
-    const r2 = selection[i].row[1];
-    const c1 = selection[i].column[0];
-    const c2 = selection[i].column[1];
+    const current = selection[i];
+    const r1 = current.row[0];
+    const r2 = current.row[1];
+    const c1 = current.column[0];
+    const c2 = current.column[1];
 
     let rf;
     let cf;
-    if (_.isNil(selection[i].row_focus)) {
+    if (_.isNil(current.row_focus)) {
       rf = r1;
     } else {
-      rf = selection[i].row_focus;
+      rf = current.row_focus;
     }
 
-    if (_.isNil(selection[i].column_focus)) {
+    if (_.isNil(current.column_focus)) {
       cf = c1;
     } else {
-      cf = selection[i].column_focus;
+      cf = current.column_focus;
     }
 
     if (_.isNil(rf) || _.isNil(cf)) {
@@ -396,25 +405,23 @@ export function normalizeSelection(
       [col_pre_f, col_f] = margeset.column;
     }
 
-    selection[i].row = [r1, r2];
-    selection[i].column = [c1, c2];
-
-    selection[i].row_focus = rf;
-    selection[i].column_focus = cf;
-
-    selection[i].left = col_pre_f;
-    // selection[i].width = col_f - col_pre_f - 1;
-    selection[i].width = col_f - col_pre_f <= 0 ? 0 : col_f - col_pre_f - 1;
-    selection[i].top = row_pre_f;
-    // selection[i].height = row_f - row_pre_f - 1;
-    selection[i].height = row_f - row_pre_f <= 0 ? 0 : row_f - row_pre_f - 1;
-
-    selection[i].left_move = col_pre;
-    // selection[i].width_move = col - col_pre - 1;
-    selection[i].width_move = col - col_pre <= 0 ? 0 : col - col_pre - 1;
-    selection[i].top_move = row_pre;
-    // selection[i].height_move = row - row_pre - 1;
-    selection[i].height_move = row - row_pre <= 0 ? 0 : row - row_pre - 1;
+    // Replace the entry instead of mutating fields — selection objects may be
+    // Immer-frozen (e.g. restored from sheetScrollRecord / prior produce).
+    selection[i] = {
+      ...current,
+      row: [r1, r2],
+      column: [c1, c2],
+      row_focus: rf,
+      column_focus: cf,
+      left: col_pre_f,
+      width: col_f - col_pre_f <= 0 ? 0 : col_f - col_pre_f - 1,
+      top: row_pre_f,
+      height: row_f - row_pre_f <= 0 ? 0 : row_f - row_pre_f - 1,
+      left_move: col_pre,
+      width_move: col - col_pre <= 0 ? 0 : col - col_pre - 1,
+      top_move: row_pre,
+      height_move: row - row_pre <= 0 ? 0 : row - row_pre - 1,
+    };
   }
   syncPrimaryCellActiveFromSelection(ctx, selection);
   return selection;
@@ -799,21 +806,35 @@ export function pasteHandlerOfPaintModel(
     }
   }
 
-  if (cellChanges.length > 0 && ctx?.hooks?.updateCellYdoc) {
-    ctx.hooks.updateCellYdoc(
-      dataVerificationYdocChanges.length > 0
-        ? [...cellChanges, ...dataVerificationYdocChanges]
-        : cellChanges,
-    );
-  } else if (
-    dataVerificationYdocChanges.length > 0 &&
-    ctx?.hooks?.updateCellYdoc
-  ) {
-    ctx.hooks.updateCellYdoc(dataVerificationYdocChanges);
+  // Empty painted cells are format-only — not persistable in celldata.
+  const migratedRanges = syncFormatOnlyRectIntoRanges(
+    ctx,
+    cfg,
+    flowdata,
+    minh,
+    maxh,
+    minc,
+    maxc,
+  );
+
+  if (ctx?.hooks?.updateCellYdoc) {
+    const ydocBatch = [...cellChanges, ...dataVerificationYdocChanges];
+    if (migratedRanges) {
+      ydocBatch.push({
+        sheetId: ctx.currentSheetId,
+        path: ['config', 'cellFormatRanges'],
+        value: migratedRanges,
+        type: 'update',
+      });
+    }
+    if (ydocBatch.length > 0) {
+      ctx.hooks.updateCellYdoc(ydocBatch);
+    }
   }
 
   const currFile = ctx.luckysheetfile[getSheetIndex(ctx, ctx.currentSheetId)!];
-  currFile.config = cfg;
+  assignActiveConfigToSheetFile(currFile, cfg);
+  ctx.config = currFile.config!;
   // Only overwrite dataVerification when we actually merged in pasted validations;
   // otherwise we would replace the sheet's dataVerification with null and remove
   // all existing validations on the sheet (e.g. on other rows).
@@ -1922,8 +1943,8 @@ export function rangeValueToHtml(
   if (idx == null) return '';
   const sheet = ctx.luckysheetfile[idx];
 
-  const rowIndexArr: number[] = [];
-  const colIndexArr: number[] = [];
+  let rowIndexArr: number[] = [];
+  let colIndexArr: number[] = [];
 
   for (let s = 0; s < (ranges?.length ?? 0); s += 1) {
     const range = ranges![s];
@@ -1947,7 +1968,7 @@ export function rangeValueToHtml(
     }
   }
 
-  let borderInfoCompute;
+  let borderInfoCompute: Record<string, any> | undefined;
   if (sheet.config?.borderInfo && sheet.config.borderInfo.length > 0) {
     // 边框
     borderInfoCompute = getBorderInfoCompute(ctx, sheetId);
@@ -1956,6 +1977,19 @@ export function rangeValueToHtml(
   let cpdata = '';
   const d = sheet.data;
   if (!d) return null;
+
+  // Clamp the serialised range to the bounding box of cells that actually carry
+  // content (data, border, or conditional format). Stops a select-all of a mostly-
+  // empty sheet from emitting thousands of blank <td>s (the whole-sheet copy blowup).
+  // Trimmed cells hold no data and no CSS, so the copy stays lossless.
+  ({ rows: rowIndexArr, cols: colIndexArr } = clampIndicesToUsedBounds(
+    rowIndexArr,
+    colIndexArr,
+    (r, c) =>
+      d[r]?.[c] != null ||
+      (borderInfoCompute != null && borderInfoCompute[`${r}_${c}`] != null) ||
+      checkCF(r, c, cf_compute) != null,
+  ));
 
   let colgroup = '';
 
@@ -1980,12 +2014,17 @@ export function rangeValueToHtml(
         let span = '';
 
         if (r === rowIndexArr[0]) {
+          // When a column carries no explicit width, the grid renders it at the
+          // sheet's default width — so the clipboard must serialize THAT default,
+          // not a hardcoded value. Emitting a wrong fallback (e.g. 72) silently
+          // resizes columns on the next paste when the real default differs.
+          const fallbackColW = sheet.defaultColWidth ?? ctx.defaultcollen;
           if (
             _.isNil(sheet.config) ||
             _.isNil(sheet.config.columnlen) ||
             _.isNil(sheet.config.columnlen[c.toString()])
           ) {
-            colgroup += '<colgroup width="72px"></colgroup>';
+            colgroup += `<colgroup width="${fallbackColW}px"></colgroup>`;
           } else {
             colgroup += `<colgroup width="${
               sheet.config.columnlen[c.toString()]
@@ -1994,12 +2033,15 @@ export function rangeValueToHtml(
         }
 
         if (c === colIndexArr[0]) {
+          // Same as column width: fall back to the sheet's default row height,
+          // not a hardcoded value, so default-height rows round-trip losslessly.
+          const fallbackRowH = sheet.defaultRowHeight ?? ctx.defaultrowlen;
           if (
             _.isNil(sheet.config) ||
             _.isNil(sheet.config.rowlen) ||
             _.isNil(sheet.config.rowlen[r.toString()])
           ) {
-            style += 'height:19px;';
+            style += `height:${fallbackRowH}px;`;
           } else {
             style += `height:${sheet.config.rowlen[r.toString()]}px;`;
           }
@@ -2259,11 +2301,12 @@ export function rangeValueToHtml(
           }
         }
 
-        const cellData = includeCellMetadata
-          ? encodeURIComponent(
-              JSON.stringify({ ...cell, _srcRow: r, _srcCol: c }),
-            )
-          : '';
+        const cellData =
+          includeCellMetadata && !isClipboardMetadataRedundant(cell)
+            ? encodeURIComponent(
+                JSON.stringify({ ...cell, _srcRow: r, _srcCol: c }),
+              )
+            : '';
         column = replaceHtml(column, { style, span, cellData });
 
         if (_.isNil(c_value)) {
@@ -2320,12 +2363,17 @@ export function rangeValueToHtml(
         column += '';
 
         if (r === rowIndexArr[0]) {
+          // When a column carries no explicit width, the grid renders it at the
+          // sheet's default width — so the clipboard must serialize THAT default,
+          // not a hardcoded value. Emitting a wrong fallback (e.g. 72) silently
+          // resizes columns on the next paste when the real default differs.
+          const fallbackColW = sheet.defaultColWidth ?? ctx.defaultcollen;
           if (
             _.isNil(sheet.config) ||
             _.isNil(sheet.config.columnlen) ||
             _.isNil(sheet.config.columnlen[c.toString()])
           ) {
-            colgroup += '<colgroup width="72px"></colgroup>';
+            colgroup += `<colgroup width="${fallbackColW}px"></colgroup>`;
           } else {
             colgroup += `<colgroup width="${
               sheet.config.columnlen[c.toString()]
@@ -2334,12 +2382,15 @@ export function rangeValueToHtml(
         }
 
         if (c === colIndexArr[0]) {
+          // Same as column width: fall back to the sheet's default row height,
+          // not a hardcoded value, so default-height rows round-trip losslessly.
+          const fallbackRowH = sheet.defaultRowHeight ?? ctx.defaultrowlen;
           if (
             _.isNil(sheet.config) ||
             _.isNil(sheet.config.rowlen) ||
             _.isNil(sheet.config.rowlen[r.toString()])
           ) {
-            style += 'height:19px;';
+            style += `height:${fallbackRowH}px;`;
           } else {
             style += `height:${sheet.config.rowlen[r.toString()]}px;`;
           }
@@ -2371,6 +2422,8 @@ export function copy(ctx: Context) {
 
   ctx.lastInternalCopyHtmlMetadataStripped = false;
   ctx.luckysheet_selection_range = [];
+  // Cell copy supersedes any prior floating-image clipboard payload
+  clearImageClipboard();
   // copy范围
   const copyRange = [];
   let RowlChange = false;
@@ -3329,6 +3382,79 @@ export function fillTime(ctx: Context): string {
   return 'success';
 }
 
+export function fillDateTime(ctx: Context): string {
+  const allowEdit = isAllowEdit(ctx);
+  if (allowEdit === false) {
+    return 'allowEdit';
+  }
+
+  const selection = ctx.luckysheet_select_save;
+  if (selection && !_.isEmpty(selection)) {
+    const d = getFlowdata(ctx);
+    if (!d) return 'dataNullError';
+
+    const cellChanges: {
+      sheetId: string;
+      path: string[];
+      key?: string;
+      value: any;
+      type?: 'update' | 'delete';
+    }[] = [];
+
+    let has_PartMC = false;
+
+    for (let s = 0; s < selection.length; s += 1) {
+      const r1 = selection[s].row[0];
+      const r2 = selection[s].row[1];
+      const c1 = selection[s].column[0];
+      const c2 = selection[s].column[1];
+
+      if (hasPartMC(ctx, ctx.config, r1, r2, c1, c2)) {
+        has_PartMC = true;
+        break;
+      }
+    }
+    if (has_PartMC) {
+      return 'partMC';
+    }
+
+    const now = new Date();
+    const formattedDateTime = `${String(now.getDate()).padStart(2, '0')}/${String(
+      now.getMonth() + 1,
+    ).padStart(2, '0')}/${now.getFullYear()} ${String(now.getHours()).padStart(
+      2,
+      '0',
+    )}:${String(now.getMinutes()).padStart(2, '0')}:${String(
+      now.getSeconds(),
+    ).padStart(2, '0')}`;
+
+    for (let s = 0; s < selection.length; s += 1) {
+      const r1 = selection[s].row[0];
+      const r2 = selection[s].row[1];
+      const c1 = selection[s].column[0];
+      const c2 = selection[s].column[1];
+
+      for (let r = r1; r <= r2; r += 1) {
+        for (let c = c1; c <= c2; c += 1) {
+          d[r][c] = { v: formattedDateTime };
+          cellChanges.push({
+            sheetId: ctx.currentSheetId,
+            path: ['celldata'],
+            value: { r, c, v: d[r][c] },
+            key: `${r}_${c}`,
+            type: 'update',
+          });
+        }
+      }
+    }
+
+    if (cellChanges.length > 0 && ctx?.hooks?.updateCellYdoc) {
+      ctx.hooks.updateCellYdoc(cellChanges);
+    }
+  }
+  return 'success';
+}
+
 // 选区是否重叠
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function selectIsOverlap(ctx: Context, range?: any) {
@@ -3559,4 +3685,79 @@ export function calcSelectionInfo(
   //   lang && !["zh", "zh_tw"].includes(lang) ? "0.00000" : "0.00000";
   const average = String(sum / numberC);
   return { numberC, count, sum, max, min, average };
+}
+
+/** Move the active selection focus to an absolute row/column (Home/End navigation). */
+export function jumpHighlightCell(ctx: Context, targetRow: number, targetCol: number) {
+  const flowdata = getFlowdata(ctx);
+  if (!flowdata?.length || !flowdata[0]?.length) return;
+
+  const last =
+    ctx.luckysheet_select_save?.[ctx.luckysheet_select_save.length - 1];
+  if (!last) return;
+
+  const r = Math.max(0, Math.min(targetRow, flowdata.length - 1));
+  const c = Math.max(0, Math.min(targetCol, flowdata[0].length - 1));
+
+  last.row = [r, r];
+  last.column = [c, c];
+  last.row_focus = r;
+  last.column_focus = c;
+  last.moveXY = { x: r, y: c };
+  normalizeSelection(ctx, ctx.luckysheet_select_save);
+  scrollToHighlightCell(ctx, r, c);
+}
+
+/**
+ * Fill every cell in the current selection with the active/focus cell value
+ * (Ctrl/Cmd+Enter — same value across the whole selection).
+ */
+export function fillSelectionWithActiveValue(
+  ctx: Context,
+  cellInput: HTMLDivElement,
+  canvas?: CanvasRenderingContext2D,
+): boolean {
+  if (!isAllowEdit(ctx)) return false;
+  const selection = ctx.luckysheet_select_save;
+  if (!selection?.length) return false;
+
+  if (ctx.luckysheetCellUpdate.length > 0) {
+    updateCell(
+      ctx,
+      ctx.luckysheetCellUpdate[0],
+      ctx.luckysheetCellUpdate[1],
+      cellInput,
+      undefined,
+      canvas,
+    );
+  }
+
+  const d = getFlowdata(ctx);
+  if (!d) return false;
+
+  const last = selection[selection.length - 1];
+  const srcR = last.row_focus ?? last.row[0];
+  const srcC = last.column_focus ?? last.column[0];
+  const sourceCell = d[srcR]?.[srcC];
+
+  for (let s = 0; s < selection.length; s += 1) {
+    const r1 = selection[s].row[0];
+    const r2 = selection[s].row[1];
+    const c1 = selection[s].column[0];
+    const c2 = selection[s].column[1];
+    for (let r = r1; r <= r2; r += 1) {
+      if (!d[r]) d[r] = [];
+      for (let c = c1; c <= c2; c += 1) {
+        if (r === srcR && c === srcC) continue;
+        d[r][c] =
+          sourceCell != null && _.isPlainObject(sourceCell)
+            ? _.cloneDeep(sourceCell)
+            : sourceCell != null
+              ? sourceCell
+              : null;
+      }
+    }
+  }
+
+  return true;
 }

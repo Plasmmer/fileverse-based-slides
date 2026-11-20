@@ -14,10 +14,16 @@ import {
   applyRichTextToWorksheet,
   type CellRichTextValue,
 } from './xlsx-richtext-utils';
+import { buildSheetDataMatrixForExport } from '../../sheet-engine/core/utils/range-format';
+import { expandSheetDataVerification } from './import-compaction';
 import {
   concatInlineStrRunsText,
   getFirstHyperlinkEntry,
 } from './xlsx-hyperlink-inline';
+import {
+  sanitizeWorksheetForOds,
+  toSheetJsCellType,
+} from './ods-export-sanitize';
 
 function sheetModelHasFilter(sheetModel: any): boolean {
   const filter = sheetModel?.filter;
@@ -86,6 +92,37 @@ export const handleExportToXLSX = async (
   dsheetId: string,
   getDocumentTitle?: (dsheetId: string) => Promise<string>,
 ) => {
+  return exportFortuneWorkbook(
+    workbookRef,
+    ydocRef,
+    dsheetId,
+    getDocumentTitle,
+    'xlsx',
+  );
+};
+
+export const handleExportToODS = async (
+  workbookRef: MutableRefObject<WorkbookInstance | null>,
+  ydocRef: MutableRefObject<Y.Doc | null>,
+  dsheetId: string,
+  getDocumentTitle?: (dsheetId: string) => Promise<string>,
+) => {
+  return exportFortuneWorkbook(
+    workbookRef,
+    ydocRef,
+    dsheetId,
+    getDocumentTitle,
+    'ods',
+  );
+};
+
+const exportFortuneWorkbook = async (
+  workbookRef: MutableRefObject<WorkbookInstance | null>,
+  ydocRef: MutableRefObject<Y.Doc | null>,
+  dsheetId: string,
+  getDocumentTitle: ((dsheetId: string) => Promise<string>) | undefined,
+  format: 'xlsx' | 'ods',
+) => {
   if (!workbookRef.current || !ydocRef.current) return;
 
   try {
@@ -104,12 +141,17 @@ export const handleExportToXLSX = async (
     ydoc.getArray(dsheetId);
 
     const sheetWithData = workbookRef.current.getAllSheets();
+    // Headless exports (folder list) pass raw ydoc sheets that may hold
+    // interned dataVerification refs; live workbook sheets pass through.
+    sheetWithData.forEach((sheet) => expandSheetDataVerification(sheet));
     const workbook = XLSXUtil.book_new();
     const sheetRichTextMaps: Map<string, CellRichTextValue>[] =
       sheetWithData.map(() => new Map());
 
+    const usedSheetNames = new Set<string>();
+
     sheetWithData.forEach((sheet, index) => {
-      const rows = sheetWithData[index]?.data || [];
+      const rows = buildSheetDataMatrixForExport(sheet);
 
       const worksheet: any = XLSXUtil.aoa_to_sheet(rows);
 
@@ -223,9 +265,8 @@ export const handleExportToXLSX = async (
         // -----------------------------
         if (v.ct) {
           if (v.ct.fa) newCell.z = v.ct.fa;
-          // inlineStr is handled above; map 'd' → 'n' for dates; pass through other types
           if (v.ct.t && v.ct.t !== 'inlineStr') {
-            newCell.t = v.ct.t === 'd' ? 'n' : v.ct.t;
+            newCell.t = toSheetJsCellType(v.ct.t, newCell.v);
           }
         }
 
@@ -301,7 +342,7 @@ export const handleExportToXLSX = async (
       // already styled above, read formatting properties directly from sheet.data.
       // Rich text (inlineStr) cells are handled separately below — skip them here
       // so we don't interfere with the rich-text pipeline.
-      ((sheet.data as any[]) ?? []).forEach((row: any[], r: number) => {
+      rows.forEach((row: any[], r: number) => {
         if (!Array.isArray(row)) return;
         row.forEach((v: any, c: number) => {
           if (!v || typeof v !== 'object') return;
@@ -373,7 +414,7 @@ export const handleExportToXLSX = async (
       // RICH TEXT from sheet.data (celldata is often empty for live sheets)
       // aoa_to_sheet leaves inlineStr cells empty since v.v is undefined;
       // set plain-text fallback here and collect runs for Pass 2.
-      ((sheet.data as any[]) ?? []).forEach((row: any[], r: number) => {
+      rows.forEach((row: any[], r: number) => {
         if (!Array.isArray(row)) return;
         row.forEach((v: any, c: number) => {
           if (!v || v.ct?.t !== 'inlineStr' || !Array.isArray(v.ct.s)) return;
@@ -394,13 +435,69 @@ export const handleExportToXLSX = async (
         applyBordersToWorksheet(worksheet, sheet.config.borderInfo);
       }
 
+      // STUB FORMAT-ONLY CELLS
+      // xlsx-js-style drops any cell that has no type `t` — so a styled but
+      // valueless cell (e.g. a black background on an empty cell)
+      // is written with no <c> element and loses
+      // its fill on export. Give such cells an empty-string type so the writer
+      // emits `<c .. t="str"><v></v></c>` and preserves the style.
+      Object.keys(worksheet).forEach((key) => {
+        if (key.startsWith('!')) return;
+        const cell = worksheet[key];
+        if (
+          cell &&
+          cell.s &&
+          cell.t == null &&
+          cell.v == null &&
+          cell.f == null
+        ) {
+          cell.t = 's';
+          cell.v = '';
+        }
+      });
+
       const subSheetName =
         sheet.name.length > 30 ? sheet.name.slice(0, 30) : sheet.name;
+
+      if (usedSheetNames.has(subSheetName)) {
+        const collided =
+          subSheetName !== sheet.name
+            ? `"${sheet.name}" is too long and collides with another sheet after being shortened to "${subSheetName}"`
+            : `Two sheets share the name "${sheet.name}"`;
+        throw new Error(
+          `${collided}. Sheet names must be unique. Rename one and try again.`,
+        );
+      }
+      usedSheetNames.add(subSheetName);
+
+      if (format === 'ods') {
+        sanitizeWorksheetForOds(worksheet);
+      }
 
       XLSXUtil.book_append_sheet(workbook, worksheet, subSheetName);
     });
 
     const title = (await getDocumentTitle?.(dsheetId)) || 'Untitled';
+
+    // ODS: SheetJS can write OpenDocument directly. Skip the ExcelJS pass
+    // (validations / CF / images) — those are XLSX-specific today.
+    if (format === 'ods') {
+      const odsBuffer: ArrayBuffer = XLSXWrite(workbook, {
+        bookType: 'ods',
+        type: 'array',
+        compression: true,
+      });
+      const blob = new Blob([odsBuffer], {
+        type: 'application/vnd.oasis.opendocument.spreadsheet',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${title}.ods`;
+      a.click();
+      URL.revokeObjectURL(url);
+      return;
+    }
 
     // Pass 1: write to buffer with xlsx-js-style (preserves all cell styling)
     const xlsxBuffer: ArrayBuffer = XLSXWrite(workbook, {
@@ -454,12 +551,12 @@ export const handleExportToXLSX = async (
           (typeof cell.text === 'string' && cell.text.length > 0
             ? cell.text
             : cell.value?.text ||
-              (Array.isArray(cell.value?.richText)
-                ? cell.value.richText
-                    .map((x: { text?: string }) => x.text || '')
-                    .join('')
-                : '') ||
-              '');
+            (Array.isArray(cell.value?.richText)
+              ? cell.value.richText
+                .map((x: { text?: string }) => x.text || '')
+                .join('')
+              : '') ||
+            '');
         cell.value = {
           text: currentText || firstLink.linkAddress,
           hyperlink: firstLink.linkAddress,
@@ -581,6 +678,15 @@ export const handleExportToXLSX = async (
       );
     });
 
+    const { applyDefinedNamesToExcelWorkbook } = await import(
+      './xlsx-defined-names'
+    );
+    applyDefinedNamesToExcelWorkbook(
+      excelWorkbook,
+      workbookRef.current.getWorkbookContext?.()?.definedNames,
+      sheetWithData,
+    );
+
     const rawBuffer = await excelWorkbook.xlsx.writeBuffer();
     const finalBuffer = await patchXlsxCf(rawBuffer, sheetCfPatches);
     const blob = new Blob([finalBuffer], {
@@ -594,5 +700,15 @@ export const handleExportToXLSX = async (
     URL.revokeObjectURL(url);
   } catch (error) {
     console.error('Export failed:', error);
+    toast({
+      title: 'Export failed',
+      description:
+        error instanceof Error && error.message
+          ? error.message
+          : `Something went wrong while exporting to .${format}. Please try again.`,
+      variant: 'error',
+      showCloseButton: true,
+      duration: 10 * 1000,
+    });
   }
 };

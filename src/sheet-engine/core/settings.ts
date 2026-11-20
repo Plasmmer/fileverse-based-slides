@@ -24,9 +24,13 @@ export type Hooks = {
   filterChange?: () => void;
   cellDataChange?: () => void;
   hyperlinkChange?: () => void;
+  /** Workbook-level named ranges (definedNames) changed — sync to Yjs. */
+  definedNamesChange?: () => void;
   updateCellYdoc?: (changes: SheetChangePath[]) => void;
-  updateAllCell?: (sheetId: string) => void;
+  updateAllCell?: (sheetId: string, caller?: string) => void;
   beforeUpdateCell?: (r: number, c: number, value: any) => boolean;
+  /** Clears RTC remote-apply lock so local edits can run data-block formulas. */
+  onLocalCellEdit?: () => void;
   afterUpdateCell?: (
     row: number,
     column: number,
@@ -143,6 +147,7 @@ export type Hooks = {
     newName: string,
   ) => boolean;
   afterUpdateSheetName?: (id: string, oldName: string, newName: string) => void;
+  onCopySheetLink?: (args: { sheetId: string; sheetName: string }) => void;
   afterImagesChange?: () => void;
   afterIframesChange?: () => void;
   afterFrozenChange?: () => void;
@@ -154,7 +159,46 @@ export type Hooks = {
   afterShowGridLinesChange?: () => void;
   afterNameChanges?: () => void;
   afterStatusChanges?: () => void;
+  /**
+   * Fired after row/column drag-drop, cell-range move, or insert/delete
+   * so host apps can remap comment keys (`${sheetId}_${row}_${col}`).
+   */
+  afterCommentAnchorMove?: (move: CommentAnchorMove) => void;
 };
+
+export type CommentAnchorMove =
+  | {
+      type: 'row' | 'column';
+      sheetId: string;
+      /** Prefixes that identify this sheet in comment keys (id, order, index). */
+      sheetKeys?: string[];
+      /** old index → new index for every row/col on the sheet */
+      indexMap: Record<number, number>;
+    }
+  | {
+      type: 'cells';
+      sheetId: string;
+      sheetKeys?: string[];
+      source: { row: [number, number]; column: [number, number] };
+      target: { row: [number, number]; column: [number, number] };
+    }
+  | {
+      type: 'insert';
+      axis: 'row' | 'column';
+      sheetId: string;
+      sheetKeys?: string[];
+      index: number;
+      count: number;
+      direction: 'lefttop' | 'rightbottom';
+    }
+  | {
+      type: 'delete';
+      axis: 'row' | 'column';
+      sheetId: string;
+      sheetKeys?: string[];
+      start: number;
+      end: number;
+    };
 
 type CommentUIDragFn = (
   e: React.MouseEvent<HTMLDivElement, MouseEvent>,
@@ -187,6 +231,7 @@ export type Settings = {
         row: number,
         column: number,
         dragHandler: CommentUIDragFn,
+        isHover?: boolean,
       ) => React.ReactNode)
     | null;
   generateSheetId?: () => string;
@@ -204,6 +249,7 @@ export type Settings = {
   onSheetCountChange?: (count: number) => void;
   isAuthorized?: boolean;
   isFlvReadOnly?: boolean;
+  isRTCActive?: boolean;
   dateBaseLocale?: DateBaseLocale;
   /** When true, do not auto-select A1 on load (e.g. onboarding modal runs first). */
   suppressInitialCellSelection?: boolean;
@@ -333,6 +379,8 @@ export const defaultSettings: Required<Settings> = {
     'clear-format',
   ], // header菜单
   sheetTabContextMenu: [
+    'copy-link',
+    '|',
     'delete',
     'copy',
     'rename',
@@ -361,6 +409,7 @@ export const defaultSettings: Required<Settings> = {
   onSheetCountChange: () => {},
   isAuthorized: false,
   isFlvReadOnly: false,
+  isRTCActive: false,
   dateBaseLocale: 'uk',
   suppressInitialCellSelection: false,
 };

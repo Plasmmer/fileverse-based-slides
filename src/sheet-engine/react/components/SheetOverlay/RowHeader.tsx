@@ -26,6 +26,9 @@ import React, {
 } from 'react';
 import WorkbookContext from '../../context';
 import { useRowDragAndDrop } from './drag_and_drop/row-helpers';
+import { getActiveTheme } from '@sheet-engine/core/theme';
+
+const DARK_THEMES = ['dark', 'theme-green'];
 
 type HoverLoc = { row: number; row_pre: number; row_index: number };
 type SelectedLoc = { row: number; row_pre: number; r1: number; r2: number };
@@ -162,8 +165,8 @@ const RowHeader: React.FC = () => {
       const clickedRowIndex = getRowIndexClicked(e.pageY, headerEl);
       if (clickedRowIndex < 0) return;
 
-      const sel = api.getSelection(context);
-      const lastSelectedCol = sel?.[0].column?.[1];
+      const sel = context.luckysheet_select_save;
+      const lastSelectedCol = sel?.[0]?.column?.[1];
       let data = getFlowdata(context);
       if (!data) data = [];
 
@@ -175,6 +178,7 @@ const RowHeader: React.FC = () => {
         });
       }
       if (
+        e.shiftKey ||
         !allRowSel ||
         (allRowSel && sel && clickedRowIndex < sel?.[0].row[0]) ||
         // @ts-expect-error: `sel?.[0].row` may be missing in some selection shapes.
@@ -218,6 +222,8 @@ const RowHeader: React.FC = () => {
       refs.globalCache,
       context.visibledatarow,
       context.currentSheetId,
+      context.luckysheet_select_save,
+      context.isFlvReadOnly,
       setContext,
       getRowIndexClicked,
       isRowDoubleClicked,
@@ -456,7 +462,7 @@ const RowHeader: React.FC = () => {
             }}
             onClick={(e) => showRow(e, item)}
           >
-            <div className="rotate-row-icon">
+            <div className="rotate-row-icon color-text-default">
               <svg
                 xmlns="http://www.w3.org/2000/svg"
                 width="5"
@@ -466,11 +472,11 @@ const RowHeader: React.FC = () => {
               >
                 <path
                   d="M0.164574 4.20629L3.54376 7.58548C3.7275 7.76922 4.04167 7.63909 4.04167 7.37924L4.04167 0.620865C4.04167 0.361018 3.7275 0.230885 3.54376 0.414625L0.164575 3.79381C0.0506717 3.90772 0.0506715 4.09239 0.164574 4.20629Z"
-                  fill="#363B3F"
+                  fill="currentColor"
                 />
               </svg>
             </div>
-            <div className="rotate-90">
+            <div className="rotate-90 color-text-default">
               <svg
                 xmlns="http://www.w3.org/2000/svg"
                 width="5"
@@ -480,7 +486,7 @@ const RowHeader: React.FC = () => {
               >
                 <path
                   d="M0.164574 4.20629L3.54376 7.58548C3.7275 7.76922 4.04167 7.63909 4.04167 7.37924L4.04167 0.620865C4.04167 0.361018 3.7275 0.230885 3.54376 0.414625L0.164575 3.79381C0.0506717 3.90772 0.0506715 4.09239 0.164574 4.20629Z"
-                  fill="#363B3F"
+                  fill="currentColor"
                 />
               </svg>
             </div>
@@ -520,26 +526,34 @@ const RowHeader: React.FC = () => {
           )}
         />
       ) : null}
-      {selectedLocation.map(({ row, row_pre, r1, r2 }, i) => (
-        <div
-          className={`fortune-row-header-selected ${isEntireRowSelection ? 'color-bg-brand' : 'color-bg-tertiary'}`}
-          key={i}
-          style={_.assign(
-            {
-              top: row_pre,
-              height: row - row_pre - 1,
-              display: 'block',
-              mixBlendMode: 'multiply' as const,
-            },
-            fixRowStyleOverflowInFreeze(
-              context,
-              r1,
-              r2,
-              refs.globalCache.freezen?.[context.currentSheetId],
-            ),
-          )}
-        />
-      ))}
+      {selectedLocation.map(({ row, row_pre, r1, r2 }, i) => {
+        const overlayBlend: React.CSSProperties['mixBlendMode'] =
+          isEntireRowSelection
+            ? 'multiply'
+            : DARK_THEMES.includes(getActiveTheme())
+              ? 'screen'
+              : 'multiply';
+        return (
+          <div
+            className={`fortune-row-header-selected ${isEntireRowSelection ? 'color-bg-brand' : 'color-bg-tertiary'}`}
+            key={i}
+            style={_.assign(
+              {
+                top: row_pre,
+                height: row - row_pre - 1,
+                display: 'block',
+                mixBlendMode: overlayBlend,
+              },
+              fixRowStyleOverflowInFreeze(
+                context,
+                r1,
+                r2,
+                refs.globalCache.freezen?.[context.currentSheetId],
+              ),
+            )}
+          />
+        );
+      })}
       {/* placeholder to overflow the container, making the container scrollable */}
       <div
         style={{ height: context.rh_height, width: 1 }}

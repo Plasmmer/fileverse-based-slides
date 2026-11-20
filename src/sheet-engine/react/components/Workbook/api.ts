@@ -1,3 +1,4 @@
+import type { CellFormatRange } from '../../../core/utils/range-format';
 import {
   addSheet,
   api,
@@ -14,6 +15,7 @@ import {
   Settings,
   SingleRange,
   createFilterOptions,
+  applySheetFilterState,
   getSheetIndex,
   Sheet,
   locale,
@@ -27,6 +29,7 @@ import {
   LiveQueryData,
   execFunctionGroup,
   jfrefreshgrid,
+  isFormulaEvalPending,
 } from '@sheet-engine/core';
 import { applyPatches } from 'immer';
 import _ from 'lodash';
@@ -141,7 +144,10 @@ export function generateAPIs(
         } catch (e) {
           // Intentionally ignore; refresh best-effort.
         }
-        draftCtx.formulaCache.execFunctionGlobalData = null;
+        // Async eval still needs execFunctionGlobalData across chunks — clear when done.
+        if (!isFormulaEvalPending(draftCtx)) {
+          draftCtx.formulaCache.execFunctionGlobalData = null;
+        }
       });
     },
 
@@ -253,6 +259,24 @@ export function generateAPIs(
           options,
           callAfterUpdate,
         ),
+      ),
+
+    /**
+     * Apply a cell value coming from a remote RTC peer, verbatim.
+     *
+     * Use this (instead of `setCellValue`) for every Yjs-driven remote apply:
+     * it writes the synced value/formula as-is without running the formula
+     * engine and without firing local-edit hooks, while keeping formula cells
+     * registered in `calcChain` so they remain reactive to future local edits.
+     */
+    applyRemoteCellValue: (
+      row: number,
+      column: number,
+      value: any,
+      options: api.CommonOptions & { type?: keyof Cell } = {},
+    ) =>
+      setContext((draftCtx) =>
+        api.applyRemoteCellValue(draftCtx, row, column, value, options),
       ),
 
     setCellError: (
@@ -433,6 +457,220 @@ export function generateAPIs(
     setSheetOrder: (orderList: Record<string, number>) =>
       setContext((draftCtx) => api.setSheetOrder(draftCtx, orderList)),
 
+    // Replace a sheet's image overlay array imperatively. Used by the RTC
+    // remote-apply path to reposition images without a full Workbook remount:
+    // images render from `insertedImgs` (active sheet) backed by
+    // `luckysheetfile[idx].images`. Updates both so the overlay repositions and
+    // the data survives the next remount/sheet-switch.
+    setSheetImages: (images: any[], options: api.CommonOptions = {}) =>
+      setContext((draftCtx) => {
+        const idx = getSheetIndex(
+          draftCtx,
+          options.id ?? draftCtx.currentSheetId,
+        );
+        if (idx == null) return;
+        draftCtx.luckysheetfile[idx].images = images;
+        if (draftCtx.luckysheetfile[idx].id === draftCtx.currentSheetId) {
+          draftCtx.insertedImgs = images;
+        }
+      }),
+
+    // Replace a sheet's iframe overlay array imperatively. Iframes render from
+    // `luckysheetfile[idx].iframes` (memoized); `insertedIframes` is kept in
+    // sync for parity with the remount init path.
+    setSheetIframes: (iframes: any[], options: api.CommonOptions = {}) =>
+      setContext((draftCtx) => {
+        const idx = getSheetIndex(
+          draftCtx,
+          options.id ?? draftCtx.currentSheetId,
+        );
+        if (idx == null) return;
+        draftCtx.luckysheetfile[idx].iframes = iframes;
+        if (draftCtx.luckysheetfile[idx].id === draftCtx.currentSheetId) {
+          draftCtx.insertedIframes = iframes;
+        }
+      }),
+
+    // Replace a sheet's dataVerification map imperatively. Used by the RTC
+    // remote-apply path so dropdown/checkbox validation rules appear on peers
+    // without a full Workbook remount (which could be skipped mid-cell-edit).
+    setSheetDataVerification: (
+      dataVerification: Record<string, any>,
+      options: api.CommonOptions = {},
+    ) =>
+      setContext(
+        (draftCtx) => {
+          const idx = getSheetIndex(
+            draftCtx,
+            options.id ?? draftCtx.currentSheetId,
+          );
+          if (idx == null) return;
+          draftCtx.luckysheetfile[idx].dataVerification = dataVerification;
+          try {
+            jfrefreshgrid(draftCtx, null, undefined, false);
+          } catch {
+            // refresh best-effort
+          }
+        },
+        { noHistory: true },
+      ),
+
+    // Apply filter + filter_select from Yjs without remount (RTC remote apply).
+    setSheetFilterState: (
+      state: {
+        filter?: Record<string, any> | null;
+        filter_select?: { row: number[]; column: number[] } | null;
+      },
+      options: api.CommonOptions = {},
+    ) =>
+      setContext(
+        (draftCtx) => {
+          const sheetId = options.id ?? draftCtx.currentSheetId;
+          applySheetFilterState(draftCtx, sheetId, state);
+          try {
+            jfrefreshgrid(draftCtx, null, undefined, false);
+          } catch {
+            // refresh best-effort
+          }
+        },
+        { noHistory: true },
+      ),
+
+    // Generic map-backed sheet metadata (hyperlink, conditionRules, …).
+    setSheetMapField: (
+      field: string,
+      value: Record<string, any> | null | undefined,
+      options: api.CommonOptions = {},
+    ) =>
+      setContext(
+        (draftCtx) => {
+          const idx = getSheetIndex(
+            draftCtx,
+            options.id ?? draftCtx.currentSheetId,
+          );
+          if (idx == null) return;
+          (draftCtx.luckysheetfile[idx] as Record<string, any>)[field] =
+            value ?? undefined;
+          try {
+            jfrefreshgrid(draftCtx, null, undefined, false);
+          } catch {
+            // refresh best-effort
+          }
+        },
+        { noHistory: true },
+      ),
+
+    /** Merge keys into a map-backed sheet field without replacing the whole map. */
+    patchSheetMapField: (
+      field: string,
+      updates: Record<string, any>,
+      deleteKeys: string[] = [],
+      options: api.CommonOptions = {},
+    ) =>
+      setContext(
+        (draftCtx) => {
+          const idx = getSheetIndex(
+            draftCtx,
+            options.id ?? draftCtx.currentSheetId,
+          );
+          if (idx == null) return;
+          const file = draftCtx.luckysheetfile[idx] as Record<string, any>;
+          const current = { ...(file[field] || {}) };
+          Object.entries(updates).forEach(([k, v]) => {
+            if (v == null) delete current[k];
+            else current[k] = v;
+          });
+          deleteKeys.forEach((k) => {
+            delete current[k];
+          });
+          file[field] =
+            Object.keys(current).length > 0 ? current : undefined;
+          try {
+            jfrefreshgrid(draftCtx, null, undefined, false);
+          } catch {
+            // refresh best-effort
+          }
+        },
+        { noHistory: true },
+      ),
+
+    /** Merge sub-keys into sheet.config without replacing the whole config object. */
+    setSheetConfigFields: (
+      partial: Record<string, any>,
+      options: api.CommonOptions & { deleteKeys?: string[] } = {},
+    ) =>
+      setContext(
+        (draftCtx) => {
+          const idx = getSheetIndex(
+            draftCtx,
+            options.id ?? draftCtx.currentSheetId,
+          );
+          if (idx == null) return;
+          const file = draftCtx.luckysheetfile[idx];
+          file.config = file.config || {};
+          const cfg = file.config as Record<string, any>;
+          Object.entries(partial).forEach(([k, v]) => {
+            if (v == null) delete cfg[k];
+            else cfg[k] = v;
+          });
+          (options.deleteKeys ?? []).forEach((k) => {
+            delete cfg[k];
+          });
+          if (file.id === draftCtx.currentSheetId) {
+            draftCtx.config = file.config!;
+          }
+
+          // Format-only empty cells live in config.cellFormatRanges, not dense
+          // cell objects that survive refresh. Remote RTC updates write the
+          // config key but peers already have a dense `data` matrix, so we must
+          // rematerialize: strip format-only cells, then re-apply ranges.
+          const rangesTouched =
+            Object.prototype.hasOwnProperty.call(partial, 'cellFormatRanges') ||
+            (options.deleteKeys ?? []).includes('cellFormatRanges');
+          if (rangesTouched && Array.isArray(file.data) && file.data.length > 0) {
+            const celldata = api.dataToCelldata(file.data);
+            const rebuilt = api.celldataToData(
+              celldata,
+              file.row,
+              file.column,
+              cfg.cellFormatRanges,
+              cfg.merge,
+            );
+            if (rebuilt) {
+              file.data = rebuilt;
+            }
+          }
+
+          try {
+            jfrefreshgrid(draftCtx, null, undefined, false);
+          } catch {
+            // refresh best-effort
+          }
+        },
+        { noHistory: true },
+      ),
+
+    setSheetConditionFormatRules: (
+      rules: any[],
+      options: api.CommonOptions = {},
+    ) =>
+      setContext(
+        (draftCtx) => {
+          const idx = getSheetIndex(
+            draftCtx,
+            options.id ?? draftCtx.currentSheetId,
+          );
+          if (idx == null) return;
+          draftCtx.luckysheetfile[idx].luckysheet_conditionformat_save = rules;
+          try {
+            jfrefreshgrid(draftCtx, null, undefined, false);
+          } catch {
+            // refresh best-effort
+          }
+        },
+        { noHistory: true },
+      ),
+
     scroll: (options: {
       scrollLeft?: number;
       scrollTop?: number;
@@ -503,8 +741,16 @@ export function generateAPIs(
       celldata: CellWithRowAndCol[],
       rowCount?: number,
       colCount?: number,
+      cellFormatRanges?: CellFormatRange[],
+      merge?: Record<string, any> | null,
     ) => {
-      return api.celldataToData(celldata, rowCount, colCount);
+      return api.celldataToData(
+        celldata,
+        rowCount,
+        colCount,
+        cellFormatRanges,
+        merge,
+      );
     },
     insertFunction: (
       selectedFuncIndex: number,
@@ -528,35 +774,58 @@ export function generateAPIs(
           [col_index] = last.column;
         }
       }
-      const formulaTxt = `<span dir="auto" class="luckysheet-formula-text-color">=</span><span dir="auto" class="luckysheet-formula-text-color">${filteredFunctionList[
-        selectedFuncIndex
-      ].n.toUpperCase()}</span><span dir="auto" class="luckysheet-formula-text-color">(</span>`;
+      const funcName = filteredFunctionList[selectedFuncIndex].n.toUpperCase();
+      const formulaTxt = `<span dir="auto" class="luckysheet-formula-text-color">=</span><span dir="auto" class="luckysheet-formula-text-color">${funcName}</span><span dir="auto" class="luckysheet-formula-text-color">(</span>`;
       const { functionlist } = locale(context);
-      setContext((ctx) => {
-        if (cellInput != null && globalCache != null) {
+
+      if (cellInput == null || globalCache == null) return;
+
+      // Populate function metadata + caret once the formula HTML is in the editor.
+      const applyFunctionState = (ctx: Context) => {
+        const spans = cellInput.childNodes;
+        if (!_.isEmpty(spans)) {
+          setCaretPosition(ctx, spans[spans.length - 1] as HTMLSpanElement, 0, 1);
+        }
+        ctx.functionHint = funcName;
+        ctx.functionCandidates = [];
+        if (_.isEmpty(ctx.formulaCache.functionlistMap)) {
+          for (let i = 0; i < functionlist.length; i += 1) {
+            ctx.formulaCache.functionlistMap[functionlist[i].n] =
+              functionlist[i];
+          }
+        }
+      };
+
+      const isEditing = (context.luckysheetCellUpdate?.length ?? 0) > 0;
+
+      if (isEditing) {
+        // Editor already active and focused: write synchronously.
+        setContext((ctx) => {
           ctx.luckysheetCellUpdate = [row_index, col_index];
           globalCache.doNotUpdateCell = true;
           cellInput.innerHTML = formulaTxt;
-          const spans = cellInput.childNodes;
-          if (!_.isEmpty(spans)) {
-            setCaretPosition(
-              ctx,
-              spans[spans.length - 1] as HTMLSpanElement,
-              0,
-              1,
-            );
-          }
-          ctx.functionHint =
-            filteredFunctionList[selectedFuncIndex].n.toUpperCase();
-          ctx.functionCandidates = [];
-          if (_.isEmpty(ctx.formulaCache.functionlistMap)) {
-            for (let i = 0; i < functionlist.length; i += 1) {
-              ctx.formulaCache.functionlistMap[functionlist[i].n] =
-                functionlist[i];
-            }
-          }
+          applyFunctionState(ctx);
           callback?.();
-        }
+        });
+        return;
+      }
+
+      // Cold entry (cell selected, not editing): enter edit mode first, then
+      // write the formula + focus AFTER React commits the edit-mode DOM.
+      // Doing both in one tick leaves the contenteditable unfocused, so the
+      // insert did not take until a second click (matches the toolbar path).
+      globalCache.doNotFocus = true;
+      globalCache.doNotUpdateCell = true;
+      setContext((ctx) => {
+        ctx.luckysheetCellUpdate = [row_index, col_index];
+      });
+      requestAnimationFrame(() => {
+        cellInput.innerHTML = formulaTxt;
+        cellInput.focus({ preventScroll: true });
+        setContext((ctx) => {
+          applyFunctionState(ctx);
+        });
+        callback?.();
       });
     },
     getLocaleContext: () => {

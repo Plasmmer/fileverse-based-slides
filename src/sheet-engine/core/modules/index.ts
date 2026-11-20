@@ -31,6 +31,7 @@ export { moveToEnd, getRangeRectsByCharacterOffset } from './cursor';
 // date base locale
 export {
   getDateBaseLocale,
+  getCanonicalDateDisplayFormat,
   getCanonicalDateEditFormat,
   getDateEditFormatForCell,
   isUsDateBaseLocale,
@@ -46,6 +47,8 @@ export {
   valueShowEs,
   isTypedCurrencyDisplayFormat,
   isCurrencyLikeNumberFormat,
+  buildFiatCurrencyFormat,
+  quoteSsfLiteral,
 } from './format';
 
 // formula
@@ -78,7 +81,20 @@ export {
   setFormulaEditorOwner,
   getAllFunctionGroup,
   suppressFormulaRangeSelectionForInitialEdit,
+  resetFormulaArrowSession,
+  ensureFormulaRangeToSheet,
+  shouldPreserveFormulaEditOnSheetSwitch,
+  activateSheetForNavigation,
+  returnToFormulaOriginSheet,
 } from './formula';
+export {
+  FORMULA_ASYNC_CHUNK_SIZE,
+  FORMULA_ASYNC_EVAL_THRESHOLD,
+  FORMULA_WORKER_CHUNK_SIZE,
+  FORMULA_WORKER_THRESHOLD,
+  isFormulaEvalPending,
+} from './formula-async-eval';
+export type { FormulaAsyncEvalJob } from './formula-async-eval';
 
 // freeze
 export { initFreeze } from './freeze';
@@ -193,6 +209,7 @@ export {
   showComments,
   showHideComment,
   showHideAllComments,
+  getCommentBoxByRC,
   onCommentBoxMoveStart,
   onCommentBoxMove,
   onCommentBoxMoveEnd,
@@ -206,6 +223,12 @@ export {
   showImgChooser,
   insertImage,
   removeActiveImage,
+  copyActiveImage,
+  cutActiveImage,
+  pasteImageItem,
+  loadImageFromFile,
+  getImageClipboard,
+  getImageCutSourceId,
   cancelActiveImgItem,
   onImageMoveStart,
   onImageResizeStart,
@@ -225,6 +248,20 @@ export {
 
 // merge
 export { mergeCells, mergeSelectionHasValues } from './merge';
+
+// removeDuplicates
+export {
+  getRemoveDuplicatesPreview,
+  removeDuplicates,
+  getRemoveDuplicatesErrorMessage,
+} from './removeDuplicates';
+export type {
+  RemoveDuplicatesColumnOption,
+  RemoveDuplicatesError,
+  RemoveDuplicatesOptions,
+  RemoveDuplicatesPreview,
+  RemoveDuplicatesResult,
+} from './removeDuplicates';
 
 // sort
 export {
@@ -289,6 +326,7 @@ export {
   clearFilterForColumn,
   toggleViewerFilter,
   createFilter,
+  applySheetFilterState,
   getFilterColumnValues,
   getFilterColumnColors,
   orderbydatafiler,
@@ -337,7 +375,7 @@ export {
 export { handleOverlayTouchStart, handleOverlayTouchEnd } from './mobile';
 
 // zoom
-export { MAX_ZOOM_RATIO, MIN_ZOOM_RATIO, handleKeydownForZoom } from './zoom';
+export { MAX_ZOOM_RATIO, MIN_ZOOM_RATIO } from './zoom';
 
 // refresh
 export { jfrefreshgrid } from './refresh';
@@ -381,12 +419,33 @@ export {
   getcellrange,
   execfunction,
   execFunctionGroup,
+  refreshFormulasUsingDefinedNames,
+  runFormulaEvalChunk,
+  applyWorkerFormulaChunkResults,
   insertUpdateFunctionGroup,
   functionCopy,
 } from './formula';
 
 // ConditionFormat (additional internal exports)
 export { checkCF, getComputeMap } from './ConditionFormat';
+
+// named ranges (workbook-level defined names)
+export {
+  isValidDefinedNameIdentifier,
+  getDefinedNameDisplayRange,
+  findDefinedNameForSelection,
+  findDefinedNameByName,
+  resolveDefinedNameForFormula,
+  addDefinedName,
+  updateDefinedName,
+  deleteDefinedName,
+  selectDefinedName,
+  openNamedRangesSidebar,
+  scheduleDefinedNamesSync,
+  shiftDefinedNamesOnInsert,
+  shiftDefinedNamesOnDelete,
+  removeDefinedNamesForSheet,
+} from './namedRanges';
 
 // cell (additional internal exports)
 export { getdatabyselection, getQKBorder } from './cell';

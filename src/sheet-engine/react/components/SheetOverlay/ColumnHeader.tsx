@@ -28,6 +28,13 @@ import React, {
 import WorkbookContext from '../../context';
 import SVGIcon from '../SVGIcon';
 import { useColumnDragAndDrop } from './drag_and_drop/column-helpers';
+import { getActiveTheme } from '@sheet-engine/core/theme';
+
+// Dark-surface themes: on these the light selection tint must `screen` (lighten)
+// instead of `multiply` (darken), so the canvas header letter keeps ~its default
+// color instead of being darkened into the highlight. The entire-selection case
+// uses the constant brand yellow, which always `multiply`s to stay readable.
+const DARK_THEMES = ['dark', 'theme-green'];
 
 const ColumnHeader: React.FC = () => {
   const { context, setContext, refs } = useContext(WorkbookContext);
@@ -148,8 +155,8 @@ const ColumnHeader: React.FC = () => {
       const clickedColIndex = getColIndexClicked(e.pageX, headerEl);
       if (clickedColIndex < 0) return;
 
-      const sel = api.getSelection(context);
-      const lastSelectedRow = sel?.[0].row?.[1];
+      const sel = context.luckysheet_select_save;
+      const lastSelectedRow = sel?.[0]?.row?.[1];
       let data = getFlowdata(context);
       if (!data) data = [];
 
@@ -160,6 +167,7 @@ const ColumnHeader: React.FC = () => {
         });
       }
       if (
+        e.shiftKey ||
         !allColSel ||
         (allColSel && sel && clickedColIndex < sel?.[0].column?.[0]) ||
         // @ts-ignore
@@ -203,6 +211,8 @@ const ColumnHeader: React.FC = () => {
       refs.globalCache,
       refs.cellInput,
       refs.fxInput,
+      context.luckysheet_select_save,
+      context.isFlvReadOnly,
       setContext,
       getColIndexClicked,
       isColDoubleClicked,
@@ -471,7 +481,7 @@ const ColumnHeader: React.FC = () => {
             }}
             onClick={(e) => showColumn(e, item)}
           >
-            <div className="">
+            <div className="color-text-default">
               <svg
                 xmlns="http://www.w3.org/2000/svg"
                 width="5"
@@ -481,11 +491,11 @@ const ColumnHeader: React.FC = () => {
               >
                 <path
                   d="M0.164574 4.20629L3.54376 7.58548C3.7275 7.76922 4.04167 7.63909 4.04167 7.37924L4.04167 0.620865C4.04167 0.361018 3.7275 0.230885 3.54376 0.414625L0.164575 3.79381C0.0506717 3.90772 0.0506715 4.09239 0.164574 4.20629Z"
-                  fill="#363B3F"
+                  fill="currentColor"
                 />
               </svg>
             </div>
-            <div className="">
+            <div className="color-text-default">
               <svg
                 xmlns="http://www.w3.org/2000/svg"
                 width="5"
@@ -495,7 +505,7 @@ const ColumnHeader: React.FC = () => {
               >
                 <path
                   d="M4.68811 4.35359L1.81188 7.22982C1.4969 7.5448 0.958328 7.32172 0.958328 6.87627L0.958328 1.12381C0.958328 0.678362 1.4969 0.455279 1.81188 0.770261L4.68811 3.64649C4.88337 3.84175 4.88337 4.15833 4.68811 4.35359Z"
-                  fill="#363B3F"
+                  fill="currentColor"
                 />
               </svg>
             </div>
@@ -562,27 +572,35 @@ const ColumnHeader: React.FC = () => {
           )}
         </div>
       ) : null}
-      {selectedLocation.map(({ col, col_pre, c1, c2 }, i) => (
-        <div
-          className={`fortune-col-header-selected ${isEntireColumnSelection ? 'color-bg-brand' : 'color-bg-tertiary'}`}
-          key={i}
-          style={_.assign(
-            {
-              left: col_pre,
-              width: col - col_pre - 1,
-              display: 'block',
-              // backgroundColor: "#EFC703",
-              mixBlendMode: 'multiply' as const,
-            },
-            fixColumnStyleOverflowInFreeze(
-              context,
-              c1,
-              c2,
-              refs.globalCache.freezen?.[context.currentSheetId],
-            ),
-          )}
-        />
-      ))}
+      {selectedLocation.map(({ col, col_pre, c1, c2 }, i) => {
+        const overlayBlend: React.CSSProperties['mixBlendMode'] =
+          isEntireColumnSelection
+            ? 'multiply'
+            : DARK_THEMES.includes(getActiveTheme())
+              ? 'screen'
+              : 'multiply';
+        return (
+          <div
+            className={`fortune-col-header-selected ${isEntireColumnSelection ? 'color-bg-brand' : 'color-bg-tertiary'}`}
+            key={i}
+            style={_.assign(
+              {
+                left: col_pre,
+                width: col - col_pre - 1,
+                display: 'block',
+                // backgroundColor: "#EFC703",
+                mixBlendMode: overlayBlend,
+              },
+              fixColumnStyleOverflowInFreeze(
+                context,
+                c1,
+                c2,
+                refs.globalCache.freezen?.[context.currentSheetId],
+              ),
+            )}
+          />
+        );
+      })}
       {/* placeholder to overflow the container, making the container scrollable */}
       <div
         className="luckysheet-cols-h-cells luckysheetsheetchange"

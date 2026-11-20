@@ -1,6 +1,8 @@
 import _ from 'lodash';
 import { v4 as uuidv4 } from 'uuid';
 import { dataToCelldata, getSheet } from './common';
+import { applyMergeConfigToData } from '../utils/merge-hydrate';
+import { applyCellFormatRangesToData, getCellFormatRangeGridBounds } from '../utils/range-format';
 import { Context } from '../context';
 import { CellMatrix, CellWithRowAndCol, Sheet } from '../types';
 import { getSheetIndex } from '../utils';
@@ -95,6 +97,11 @@ export function initSheetData(
     lastRowNum = Math.max(lastRowNum, draftCtx.defaultrowNum);
     lastColNum = Math.max(lastColNum, draftCtx.defaultcolumnNum);
   }
+  const rangeBounds = getCellFormatRangeGridBounds(newData.config?.cellFormatRanges);
+  if (rangeBounds) {
+    lastRowNum = Math.max(lastRowNum, rangeBounds.maxRow + 1);
+    lastColNum = Math.max(lastColNum, rangeBounds.maxCol + 1);
+  }
   if (lastRowNum && lastColNum) {
     const expandedData: Sheet['data'] = _.times(lastRowNum, () =>
       _.times(lastColNum, () => null),
@@ -102,6 +109,8 @@ export function initSheetData(
     celldata?.forEach((d) => {
       expandedData[d.r][d.c] = d.v;
     });
+    applyCellFormatRangesToData(expandedData, newData.config?.cellFormatRanges);
+    applyMergeConfigToData(expandedData, newData.config?.merge);
     if (draftCtx.luckysheetfile[index] == null) {
       newData.data = expandedData;
       delete newData.celldata;
@@ -113,6 +122,22 @@ export function initSheetData(
     return expandedData;
   }
   return null;
+}
+
+/** Build dense `data` from sparse `celldata` when a sheet is activated or referenced. */
+export function ensureSheetFlowdata(
+  ctx: Context,
+  options: { index?: number; id?: string } = {},
+): CellMatrix | null {
+  const index =
+    options.index ?? getSheetIndex(ctx, options.id ?? ctx.currentSheetId);
+  if (index == null) return null;
+  const sheet = ctx.luckysheetfile[index];
+  if (!sheet) return null;
+  if (sheet.data?.length) {
+    return sheet.data;
+  }
+  return initSheetData(ctx, index, sheet);
 }
 
 export function hideSheet(ctx: Context, sheetId: string) {
@@ -202,12 +227,17 @@ export function copySheet(ctx: Context, sheetId: string) {
   const newSheet = ctx.luckysheetfile[newSheetIndex];
   const newSheetId = newSheet.id as string;
   if (newSheet.calcChain?.length) {
-    newSheet.calcChain = newSheet.calcChain.map(
-      (entry: { r: number; c: number; id?: string }) => ({
+    newSheet.calcChain = newSheet.calcChain
+      .filter(
+        (entry: { r?: number; c?: number; id?: string } | null | undefined) =>
+          entry != null &&
+          typeof entry.r === 'number' &&
+          typeof entry.c === 'number',
+      )
+      .map((entry: { r: number; c: number; id?: string }) => ({
         ...entry,
         id: newSheetId,
-      }),
-    );
+      }));
   }
   if (newSheet.dynamicArray?.length) {
     newSheet.dynamicArray = newSheet.dynamicArray.map(
@@ -236,7 +266,7 @@ export function copySheet(ctx: Context, sheetId: string) {
   // Duplicating a sheet bypasses per-cell update flows; ensure external sync (e.g. Yjs) gets a full snapshot.
   // Prefer updateAllCell for performance; otherwise emit celldata updates for the new sheet.
   if (ctx?.hooks?.updateAllCell) {
-    ctx.hooks.updateAllCell(newSheetId);
+    ctx.hooks.updateAllCell(newSheetId, 'duplicateSheet');
   } else if (ctx?.hooks?.updateCellYdoc) {
     const changes: any[] = [];
     const celldata = newSheet.celldata || dataToCelldata(newSheet.data);

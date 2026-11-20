@@ -1,6 +1,10 @@
 import { WorkbookInstance } from '@sheet-engine/react';
 import * as Y from 'yjs';
+import isEqual from 'lodash/isEqual';
 import { SheetChangePath, updateYdocSheetData } from '../utils/update-ydoc';
+import { shouldPersistCelldataCell } from '../../sheet-engine/core/utils/cell-persist-utils';
+import { applyCellFormatRangesCommits } from '../../sheet-engine/core/utils/mirror-cell-format-ranges';
+import { detachWorkbookData } from '../utils/detach-workbook-data';
 
 type SyncContext = {
   sheetEditorRef: React.MutableRefObject<WorkbookInstance | null>;
@@ -117,7 +121,9 @@ const toCalcChainMap = (sheet: any) => {
 
   if (typeof calcChain === 'object') {
     Object.entries(calcChain).forEach(([k, v]) => {
-      map.set(k, v);
+      if (v && typeof (v as any).r === 'number' && typeof (v as any).c === 'number') {
+        map.set(k, v);
+      }
     });
   }
 
@@ -175,8 +181,24 @@ export const syncCurrentSheetField = (
   if (!currentSheet || !currentYdocSheet) return;
 
   const ydocValue = getSheetField(currentYdocSheet, field);
-  if (ydocValue !== currentSheet[field]) {
-    setSheetField(currentYdocSheet, field, currentSheet[field]);
+  const nextValue = currentSheet[field];
+
+  // Object fields (config, frozen, images, iframes) are rebuilt as fresh
+  // references on every Workbook remount, so a reference check (`!==`) reports
+  // a change even when the value is identical. In RTC that re-write broadcasts
+  // to peers, who remount (config/frozen are classified structural), rebuild a
+  // fresh reference, and write it straight back — a continuous cross-peer
+  // remount ping-pong (the "filter flicker"). Deep-compare object values so an
+  // unchanged field never re-writes.
+  const isObjectValue =
+    (typeof nextValue === 'object' && nextValue !== null) ||
+    (typeof ydocValue === 'object' && ydocValue !== null);
+  const changed = isObjectValue
+    ? !isEqual(ydocValue, nextValue)
+    : ydocValue !== nextValue;
+
+  if (changed) {
+    setSheetField(currentYdocSheet, field, nextValue);
     handleOnChangePortalUpdate();
   }
 };
@@ -209,7 +231,7 @@ export const createSheetLengthChangeHandler = ({
       editorSheetLength > 1 &&
       docSheetLength > 0
     ) {
-      currentDataRef.current = sheets;
+      currentDataRef.current = detachWorkbookData(sheets);
       setTimeout(() => {
         const createdSheet = sheets[sheets.length - 1];
         const sheet = { ...createdSheet };
@@ -221,7 +243,7 @@ export const createSheetLengthChangeHandler = ({
         ySheet.set('row', sheet.row ?? 500);
         ySheet.set('column', sheet.column ?? 36);
         ySheet.set('status', 1);
-        ySheet.set('config', sheet.config ?? {});
+        ySheet.set('config', toYMapFromObject(sheet.config ?? {}));
         ySheet.set('celldata', toCellMap(sheet));
         ySheet.set('calcChain', toCalcChainMap(sheet));
         ySheet.set(
@@ -263,6 +285,15 @@ export const createSheetLengthChangeHandler = ({
         if (sheet.color != null) {
           ySheet.set('color', sheet.color);
         }
+        if (sheet.defaultRowHeight != null) {
+          ySheet.set('defaultRowHeight', sheet.defaultRowHeight);
+        }
+        if (sheet.defaultColWidth != null) {
+          ySheet.set('defaultColWidth', sheet.defaultColWidth);
+        }
+        if (sheet.zoomRatio != null) {
+          ySheet.set('zoomRatio', sheet.zoomRatio);
+        }
 
         ydocRef.current?.transact(() => {
           sheetArray.push([ySheet]);
@@ -282,7 +313,9 @@ export const createSheetLengthChangeHandler = ({
       );
 
       if (removedIndex !== -1) {
-        currentDataRef.current = sheetEditorRef.current?.getAllSheets() || [];
+        currentDataRef.current = detachWorkbookData(
+          sheetEditorRef.current?.getAllSheets() || [],
+        );
         setTimeout(() => {
           ydocRef.current?.transact(() => {
             sheetArray.delete(removedIndex, 1);
@@ -478,6 +511,7 @@ export const updateAllCell = (
     handleOnChangePortalUpdate,
   }: SyncContext,
   subSheetId: string,
+  caller = 'unknown',
 ) => {
   const workbookContext = sheetEditorRef.current?.getWorkbookContext?.() as any;
   const currentSheet = getCurrentSheetSafe(sheetEditorRef, 'updateAllCell');
@@ -500,6 +534,8 @@ export const updateAllCell = (
         (sheet as any).celldata,
         (sheet as any).row,
         (sheet as any).column,
+        (sheet as any).config?.cellFormatRanges,
+        (sheet as any).config?.merge,
       ) ?? undefined;
   }
   if (!Array.isArray(dataMatrix)) return;
@@ -509,10 +545,12 @@ export const updateAllCell = (
     const row = dataMatrix[r];
     if (!Array.isArray(row)) continue;
     for (let c = 0; c < row.length; c++) {
+      const cell = row[c];
+      if (!shouldPersistCelldataCell(cell)) continue;
       changes.push({
         sheetId: subSheetId,
         path: ['celldata'],
-        value: { r, c, v: row[c] },
+        value: { r, c, v: cell },
         key: `${r}_${c}`,
         type: 'update',
       });
@@ -525,5 +563,17 @@ export const updateAllCell = (
     dsheetId,
     changes,
     handleOnChangePortalUpdate,
+    (commits) => {
+      applyCellFormatRangesCommits(
+        commits,
+        sheetEditorRef.current?.getWorkbookSetContext?.() ?? null,
+      );
+    },
   );
+
+  if (changes.length > 0) {
+    console.warn(
+      `[Yjs] updateAllCell caller=${caller} sheet=${subSheetId} cells=${changes.length}`,
+    );
+  }
 };

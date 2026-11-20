@@ -15,7 +15,9 @@ export const getCustomToolbarItems = ({
   setExportDropdownOpen,
   handleCSVUpload,
   handleXLSXUpload,
+  handleODSUpload,
   handleExportToXLSX,
+  handleExportToODS,
   handleExportToCSV,
   handleExportToJSON,
   sheetEditorRef,
@@ -52,7 +54,18 @@ export const getCustomToolbarItems = ({
     file?: File,
     importType?: string,
   ) => void | Promise<void>;
+  handleODSUpload: (
+    event: ChangeEventHandler<HTMLInputElement> | undefined,
+    file?: File,
+    importType?: string,
+  ) => void | Promise<void>;
   handleExportToXLSX: (
+    sheetEditorRef: React.RefObject<WorkbookInstance | null>,
+    ydocRef: React.RefObject<Y.Doc | null>,
+    dsheetId: string,
+    getDocumentTitle?: (dsheetId: string) => Promise<string>,
+  ) => void;
+  handleExportToODS: (
     sheetEditorRef: React.RefObject<WorkbookInstance | null>,
     ydocRef: React.RefObject<Y.Doc | null>,
     dsheetId: string,
@@ -76,26 +89,30 @@ export const getCustomToolbarItems = ({
   setForceSheetRender: React.Dispatch<React.SetStateAction<number>>;
   toggleTemplateSidebar: (() => void) | undefined;
   setShowFetchURLModal:
-    | React.Dispatch<React.SetStateAction<boolean>>
-    | undefined;
+  | React.Dispatch<React.SetStateAction<boolean>>
+  | undefined;
 }) => {
   return [
-    {
-      key: 'Smart Contract',
-      tooltip: 'Smart Contract',
-      icon: (
-        <SmartContractButton
-          handleImportSmartContract={() =>
-            setShowSmartContractModal?.((prev: boolean) => {
-              return !prev;
-            })
-          }
-          handleViewSmartContract={() =>
-            document.getElementById('view-smart-contract')?.click()
-          }
-        />
-      ),
-    },
+    ...(setShowSmartContractModal
+      ? [
+          {
+            key: 'Smart Contract',
+            tooltip: 'Smart Contract',
+            icon: (
+              <SmartContractButton
+                handleImportSmartContract={() =>
+                  setShowSmartContractModal?.((prev: boolean) => {
+                    return !prev;
+                  })
+                }
+                handleViewSmartContract={() =>
+                  document.getElementById('view-smart-contract')?.click()
+                }
+              />
+            ),
+          },
+        ]
+      : []),
     {
       key: 'import-export',
       tooltip: 'Import/Export',
@@ -121,8 +138,17 @@ export const getCustomToolbarItems = ({
             )
           }
           handleXLSXUpload={handleXLSXUpload}
+          handleODSUpload={handleODSUpload}
           handleExportToXLSX={() =>
             handleExportToXLSX(
+              sheetEditorRef,
+              ydocRef,
+              dsheetId,
+              getDocumentTitle,
+            )
+          }
+          handleExportToODS={() =>
+            handleExportToODS(
               sheetEditorRef,
               ydocRef,
               dsheetId,
@@ -197,6 +223,12 @@ type ReadOnlyExportDeps = {
     dsheetId: string,
     getDocumentTitle?: (dsheetId: string) => Promise<string>,
   ) => void;
+  handleExportToODS: (
+    sheetEditorRef: React.RefObject<WorkbookInstance | null>,
+    ydocRef: React.RefObject<Y.Doc | null>,
+    dsheetId: string,
+    getDocumentTitle?: (dsheetId: string) => Promise<string>,
+  ) => void;
   handleExportToCSV: (
     sheetEditorRef: React.RefObject<WorkbookInstance | null>,
     ydocRef: React.RefObject<Y.Doc | null>,
@@ -217,6 +249,7 @@ type ReadOnlyExportDeps = {
 export const getReadOnlyCustomToolbarItems = ({
   setExportDropdownOpen,
   handleExportToXLSX,
+  handleExportToODS,
   handleExportToCSV,
   handleExportToJSON,
   sheetEditorRef,
@@ -236,6 +269,14 @@ export const getReadOnlyCustomToolbarItems = ({
           setExportDropdownOpen={setExportDropdownOpen}
           handleExportToXLSX={() =>
             handleExportToXLSX(
+              sheetEditorRef,
+              ydocRef,
+              dsheetId,
+              getDocumentTitle,
+            )
+          }
+          handleExportToODS={() =>
+            handleExportToODS(
               sheetEditorRef,
               ydocRef,
               dsheetId,

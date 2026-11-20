@@ -5,6 +5,7 @@ import React, {
   useEffect,
   useLayoutEffect,
   useMemo,
+  useState,
 } from 'react';
 import './index.css';
 import {
@@ -33,12 +34,14 @@ import {
   getFlowdata,
   fixRowStyleOverflowInFreeze,
   fixColumnStyleOverflowInFreeze,
-  handleKeydownForZoom,
   isLegacyFormulaRangeMode,
   isFormulaReferenceInputMode,
   expandCellRectForMerge,
   seletedHighlistByindex,
   selectionIsExactlyOneMergeBlock,
+  rowLocation,
+  colLocation,
+  fixPositionOnFrozenCells,
 } from '@sheet-engine/core';
 import _ from 'lodash';
 import WorkbookContext, { SetContextOptions } from '../../context';
@@ -58,6 +61,8 @@ import { useDialog } from '../../hooks/useDialog';
 import DropDownList from '../DataVerification/DropdownList';
 import IframeBoxs from '../IFrameBoxs/iFrameBoxs';
 import ErrorBoxes from '../ErrorState';
+import ensLogo from '../../../../editor/assets/ens.svg';
+import verifiedMark from '../../../../editor/assets/verified-mark.png';
 
 /**
  * Cell to outline as "primary" for multi-cell ranges: `context.primaryCellActive`, else
@@ -116,6 +121,7 @@ function cfRuleHoverHighlightHcStyle(hex: string) {
 const SheetOverlay: React.FC = () => {
   const { context, setContext, settings, refs } = useContext(WorkbookContext);
   const { info, rightclick } = locale(context);
+  const [hoveredCell, setHoveredCell] = useState<{ row: number; col: number } | null>(null);
 
   const flowdataForQuickSearchDeps = getFlowdata(context);
 
@@ -357,6 +363,15 @@ const SheetOverlay: React.FC = () => {
     });
   }, [setContext]);
 
+  // Note: this debounce only ever fires the "hide" branch of showLinkCard (link == null
+  // clears ctx.linkCard) — when hovering an actual link, showLinkCard is called
+  // synchronously below and this debounced call is invoked with skip=true just to cancel
+  // any pending hide from a previous non-link hover. So this wait controls how long the
+  // hover-preview card lingers after the mouse leaves the linked cell; keep it short so the
+  // card disappears quickly, while still bridging the small gap the pointer crosses when
+  // moving from the cell down into the card itself.
+  const LINK_CARD_HIDE_DELAY_MS = 100;
+
   const debouncedShowLinkCard = useMemo(
     () =>
       _.debounce(
@@ -372,7 +387,7 @@ const SheetOverlay: React.FC = () => {
             showLinkCard(draftCtx, r, c, undefined, isEditing);
           });
         },
-        800,
+        LINK_CARD_HIDE_DELAY_MS,
       ),
     [setContext],
   );
@@ -421,6 +436,22 @@ const SheetOverlay: React.FC = () => {
           containerRef.current!,
           refs.fxInput.current,
         );
+
+        const containerMain = document.getElementsByClassName('fortune-cell-area')[0] as HTMLDivElement;
+        const rect = containerMain?.getBoundingClientRect();
+        if (rect) {
+          const mouseX = nativeEvent.pageX - rect.left - window.scrollX;
+          const mouseY = nativeEvent.pageY - rect.top - window.scrollY;
+          const _x = mouseX + draftCtx.scrollLeft;
+          const _y = mouseY + draftCtx.scrollTop;
+          const freeze = refs.globalCache.freezen?.[draftCtx.currentSheetId];
+          const { x, y } = fixPositionOnFrozenCells(freeze, _x, _y, mouseX, mouseY);
+          const row = rowLocation(y, draftCtx.visibledatarow)[2];
+          const col = colLocation(x, draftCtx.visibledatacolumn)[2];
+          setHoveredCell((prev) =>
+            prev?.row === row && prev?.col === col ? prev : { row, col },
+          );
+        }
       });
     },
     [
@@ -619,19 +650,8 @@ const SheetOverlay: React.FC = () => {
         ev.preventDefault();
         return;
       }
-
-      const newZoom = handleKeydownForZoom(ev, context.zoomRatio);
-      if (newZoom !== context.zoomRatio) {
-        setContext((ctx) => {
-          ctx.zoomRatio = newZoom;
-          ctx.luckysheetfile[
-            getSheetIndex(ctx, ctx.currentSheetId)!
-          ].zoomRatio = newZoom;
-        });
-      }
     },
     [
-      context.zoomRatio,
       context.currentSheetId,
       context.luckysheet_select_save,
       setContext,
@@ -1172,13 +1192,21 @@ const SheetOverlay: React.FC = () => {
                 c - 1 === -1 ? 0 : context.visibledatacolumn[c - 1];
               const row = context.visibledatarow[r];
               const col = context.visibledatacolumn[c];
-              const width = col - col_pre - 1;
-              const height = row - row_pre - 1;
-              const usernameStyle = {
-                maxWidth: width + 1,
-                backgroundColor: color,
-              };
-              _.set(usernameStyle, r === 0 ? 'top' : 'bottom', height);
+              const width = col - col_pre;
+              const height = row - row_pre;
+              const usernameStyle: React.CSSProperties = presence.isEns
+                ? {
+                    backgroundColor: 'hsl(var(--color-bg-default))',
+                    color,
+                    border: `2px solid ${color}`,
+                    left: width - 2,
+                    bottom: height - 2,
+                  }
+                : {
+                    backgroundColor: color,
+                    left: width - 2,
+                    bottom: height - 2,
+                  };
 
               return (
                 <div
@@ -1186,18 +1214,39 @@ const SheetOverlay: React.FC = () => {
                   className="fortune-presence-selection"
                   style={{
                     left: col_pre,
-                    top: row_pre - 2,
+                    top: row_pre,
                     width,
                     height,
                     borderColor: color,
-                    borderWidth: 1,
+                    borderWidth: 2,
                   }}
                 >
                   <div
-                    className="fortune-presence-username"
-                    style={usernameStyle}
+                    className={`fortune-presence-username${presence.isEns ? ' fortune-presence-username--ens' : ''}`}
+                    style={{
+                      ...usernameStyle,
+                      opacity: hoveredCell?.row === r && hoveredCell?.col === c ? 1 : 0,
+                    }}
                   >
-                    {presence.username}
+                    {presence.isEns ? (
+                      <>
+                        <img
+                          src={ensLogo}
+                          className="fortune-presence-ens-logo"
+                          alt=""
+                        />
+                        <span className="fortune-presence-ens-name">
+                          {presence.username}
+                        </span>
+                        <img
+                          src={verifiedMark}
+                          className="fortune-presence-ens-tick"
+                          alt=""
+                        />
+                      </>
+                    ) : (
+                      presence.username
+                    )}
                   </div>
                 </div>
               );
@@ -1296,7 +1345,7 @@ const SheetOverlay: React.FC = () => {
                     placeholder={context.addDefaultRows.toString()}
                   />{' '}
                   <span style={{ fontSize: 14 }}>{info.row}</span>{' '}
-                  <span style={{ fontSize: 14, color: '#9c9c9c' }}>
+                  <span style={{ fontSize: 14, color: 'hsl(var(--color-text-secondary))' }}>
                     ({info.addLast})
                   </span>
                   <span

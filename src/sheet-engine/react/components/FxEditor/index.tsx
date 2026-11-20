@@ -21,6 +21,9 @@ import {
   functionHTMLGenerate,
   isAllowEdit,
   suppressFormulaRangeSelectionForInitialEdit,
+  resetFormulaArrowSession,
+  ensureFormulaRangeToSheet,
+  returnToFormulaOriginSheet,
   normalizeSelection,
   snapSheetSelectionFocusToCellPreserveMultiRange,
   advancePrimaryCellInLastMultiSelection,
@@ -48,6 +51,7 @@ import CellDatePicker from '../SheetOverlay/CellDatePicker';
 import usePrevious from '../../hooks/usePrevious';
 import { useFormulaEditorHistory } from '../../hooks/useFormulaEditorHistory';
 import { useRerenderOnFormulaCaret } from '../../hooks/useRerenderOnFormulaCaret';
+import { useLastFormulaCaretOffset } from '../../hooks/useLastFormulaCaretOffset';
 import { LucideIcon } from '../SheetOverlay/LucideIcon';
 
 import {
@@ -62,6 +66,7 @@ import {
   isStrictFormulaEditorText,
   isFormulaCompleteAtCaret,
 } from '../SheetOverlay/helper';
+import { matchUndoRedoShortcut } from '@sheet-engine/core/events/keyboard-shortcut-utils';
 import { isFormulaSegmentBoundaryKey } from '../SheetOverlay/formula-segment-boundary';
 
 const FxEditor: React.FC = () => {
@@ -97,7 +102,7 @@ const FxEditor: React.FC = () => {
       : null;
   const lockedFormulaSearchTop =
     formulaSearchActiveCellKey &&
-    formulaSearchTopLockRef.current?.cellKey === formulaSearchActiveCellKey
+      formulaSearchTopLockRef.current?.cellKey === formulaSearchActiveCellKey
       ? formulaSearchTopLockRef.current.top
       : null;
   const prevCellUpdate = usePrevious<any[]>(context.luckysheetCellUpdate);
@@ -292,6 +297,59 @@ const FxEditor: React.FC = () => {
     }
   }, [context.luckysheetCellUpdate, refs.fxInput]);
 
+  const lastFxCaretOffsetRef = useLastFormulaCaretOffset(
+    refs.fxInput,
+    context.luckysheetCellUpdate.length > 0,
+  );
+
+  useEffect(() => {
+    if (!context.formulaCache.refocusFormulaEditorAfterSheetSwitch) return;
+    if (context.luckysheetCellUpdate.length === 0) return;
+    if (getFormulaEditorOwner(context) !== 'fx') return;
+
+    const editor = refs.fxInput.current;
+    if (!editor) return;
+
+    setContext((ctx) => {
+      ctx.formulaCache.refocusFormulaEditorAfterSheetSwitch = false;
+    });
+
+    requestAnimationFrame(() => {
+      editor.focus({ preventScroll: true });
+      // Restore the caret where the user left it; see InputBox for details.
+      const savedOffset = lastFxCaretOffsetRef.current;
+      if (savedOffset != null) {
+        setCursorPosition(
+          editor,
+          Math.min(savedOffset, editor.textContent?.length ?? 0),
+        );
+        return;
+      }
+      const managed = editor.querySelector(
+        'span.fortune-formula-functionrange-cell',
+      ) as HTMLElement | null;
+      if (managed?.firstChild?.nodeType === Node.TEXT_NODE) {
+        const sel = window.getSelection();
+        const textNode = managed.firstChild;
+        if (sel && textNode) {
+          const range = document.createRange();
+          range.setStart(textNode, textNode.textContent?.length ?? 0);
+          range.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+      }
+    });
+  }, [
+    context.formulaCache.refocusFormulaEditorAfterSheetSwitch,
+    context.currentSheetId,
+    context.luckysheetCellUpdate.length,
+    context,
+    refs.fxInput,
+    setContext,
+    lastFxCaretOffsetRef,
+  ]);
+
   const onFocus = useCallback(() => {
     if (context.allowEdit === false) {
       return;
@@ -305,22 +363,11 @@ const FxEditor: React.FC = () => {
         setFormulaEditorOwner(draftCtx, 'fx');
         const last =
           draftCtx.luckysheet_select_save![
-            draftCtx.luckysheet_select_save!.length - 1
+          draftCtx.luckysheet_select_save!.length - 1
           ];
 
         const row_index = last.row_focus;
         const col_index = last.column_focus;
-
-        if (!_.isNil(row_index) && !_.isNil(col_index)) {
-          const flowdata = getFlowdata(draftCtx);
-          const cellAt = flowdata?.[row_index]?.[col_index] as
-            | { f?: string }
-            | null
-            | undefined;
-          if (cellAt?.f != null && String(cellAt.f).trim() !== '') {
-            suppressFormulaRangeSelectionForInitialEdit(draftCtx);
-          }
-        }
 
         // draftCtx.luckysheetCellUpdate = [row_index, col_index];
         // refs.globalCache.doNotFocus = true;
@@ -329,6 +376,29 @@ const FxEditor: React.FC = () => {
           currentUpdate.length === 2 &&
           currentUpdate[0] === row_index &&
           currentUpdate[1] === col_index;
+
+        // Only a session that is *opening* decides auto reference selection.
+        // Focusing the bar while already editing this cell (type-over, then a
+        // click into the bar) must keep the session's state and F2 choice.
+        if (
+          !alreadyEditingSameCell &&
+          !_.isNil(row_index) &&
+          !_.isNil(col_index)
+        ) {
+          const flowdata = getFlowdata(draftCtx);
+          const cellAt = flowdata?.[row_index]?.[col_index] as
+            | { f?: string }
+            | null
+            | undefined;
+          if (cellAt?.f != null && String(cellAt.f).trim() !== '') {
+            suppressFormulaRangeSelectionForInitialEdit(draftCtx, [
+              row_index,
+              col_index,
+            ]);
+          } else {
+            resetFormulaArrowSession(draftCtx);
+          }
+        }
 
         if (!alreadyEditingSameCell) {
           // Preserve mouse-placed caret on first FX focus-open. Without this,
@@ -434,18 +504,23 @@ const FxEditor: React.FC = () => {
         const anchor = formulaAnchorCellRef.current;
         if (anchor != null) {
           const [anchorRow, anchorCol] = anchor;
+          const onForeignSheet =
+            !!context.formulaCache.rangetosheet &&
+            context.formulaCache.rangetosheet !== context.currentSheetId;
           // skipNextAnchorSelectionSyncRef.current = true;
           setTimeout(() => {
             setContext((draftCtx) => {
               draftCtx.luckysheetCellUpdate = [anchorRow, anchorCol];
-              snapSheetSelectionFocusToCellPreserveMultiRange(
-                draftCtx,
-                anchorRow,
-                anchorCol,
-              );
+              if (!onForeignSheet) {
+                snapSheetSelectionFocusToCellPreserveMultiRange(
+                  draftCtx,
+                  anchorRow,
+                  anchorCol,
+                );
+                // Recompute selection box immediately so UI snaps back to anchor cell.
+                moveHighlightCell(draftCtx, 'down', 0, 'rangeOfSelect');
+              }
               draftCtx.formulaCache.formulaKeyboardRefSync = false;
-              // Recompute selection box immediately so UI snaps back to anchor cell.
-              moveHighlightCell(draftCtx, 'down', 0, 'rangeOfSelect');
               markRangeSelectionDirty(draftCtx);
               // Keep completed referenced-cell highlights persistent in Fx editor
               // after delete/backspace, same behavior as in-cell editor.
@@ -498,8 +573,17 @@ const FxEditor: React.FC = () => {
         context.luckysheetCellUpdate.length === 2 &&
         formulaAnchorCellRef.current == null
       ) {
+        // Starting a new formula flow — clear stale keyboard/mouse range state so
+        // idle selection on the edit cell cannot become a self-ref (`=` → `=A1`).
         setContext((draftCtx) => {
+          ensureFormulaRangeToSheet(draftCtx);
           draftCtx.formulaCache.rangeSelectionActive = null;
+          draftCtx.formulaCache.formulaKeyboardRefSync = false;
+          draftCtx.formulaCache.func_selectedrange = undefined;
+          draftCtx.formulaCache.rangestart = false;
+          draftCtx.formulaCache.rangedrag_column_start = false;
+          draftCtx.formulaCache.rangedrag_row_start = false;
+          draftCtx.formulaRangeSelect = undefined;
         });
         formulaAnchorCellRef.current = [
           context.luckysheetCellUpdate[0],
@@ -523,14 +607,19 @@ const FxEditor: React.FC = () => {
           draftCtx.formulaCache.rangeSelectionActive = null;
         });
         const [anchorRow, anchorCol] = formulaAnchorCellRef.current;
+        const onForeignSheet =
+          !!context.formulaCache.rangetosheet &&
+          context.formulaCache.rangetosheet !== context.currentSheetId;
         setTimeout(() => {
           setContext((draftCtx) => {
             draftCtx.luckysheetCellUpdate = [anchorRow, anchorCol];
-            snapSheetSelectionFocusToCellPreserveMultiRange(
-              draftCtx,
-              anchorRow,
-              anchorCol,
-            );
+            if (!onForeignSheet) {
+              snapSheetSelectionFocusToCellPreserveMultiRange(
+                draftCtx,
+                anchorRow,
+                anchorCol,
+              );
+            }
             draftCtx.formulaCache.formulaKeyboardRefSync = false;
             draftCtx.formulaRangeSelect = undefined;
             draftCtx.formulaCache.selectingRangeIndex = -1;
@@ -542,10 +631,12 @@ const FxEditor: React.FC = () => {
             createRangeHightlight(
               draftCtx,
               refs.fxInput.current?.innerHTML ||
-                refs.cellInput.current?.innerHTML ||
-                '',
+              refs.cellInput.current?.innerHTML ||
+              '',
             );
-            moveHighlightCell(draftCtx, 'down', 0, 'rangeOfSelect');
+            if (!onForeignSheet) {
+              moveHighlightCell(draftCtx, 'down', 0, 'rangeOfSelect');
+            }
           });
         }, 0);
       }
@@ -583,9 +674,9 @@ const FxEditor: React.FC = () => {
       }
 
       if ((e.metaKey || e.ctrlKey) && context.luckysheetCellUpdate.length > 0) {
-        if (e.code === 'KeyZ' || e.code === 'KeyY') {
-          const isRedo =
-            e.code === 'KeyY' || (e.code === 'KeyZ' && (e as any).shiftKey);
+        const undoRedo = matchUndoRedoShortcut(e as unknown as KeyboardEvent);
+        if (undoRedo) {
+          const isRedo = undoRedo === 'redo';
           // Always intercept undo/redo in-editor to avoid native browser
           // history fighting our snapshot stack.
           e.preventDefault();
@@ -653,8 +744,8 @@ const FxEditor: React.FC = () => {
           if (previousItem) {
             previousItem.classList.add('luckysheet-formula-search-item-active');
           }
+          e.preventDefault();
         }
-        e.preventDefault();
       } else if (
         !(e.metaKey || e.ctrlKey) &&
         e.key === 'ArrowDown' &&
@@ -684,8 +775,8 @@ const FxEditor: React.FC = () => {
           if (nextItem) {
             nextItem.classList.add('luckysheet-formula-search-item-active');
           }
+          e.preventDefault();
         }
-        e.preventDefault();
       }
 
       setContext((draftCtx) => {
@@ -725,7 +816,7 @@ const FxEditor: React.FC = () => {
                 draftCtx.luckysheet_select_save = _.cloneDeep(selSnapshot);
                 const lastSel =
                   draftCtx.luckysheet_select_save[
-                    draftCtx.luckysheet_select_save.length - 1
+                  draftCtx.luckysheet_select_save.length - 1
                   ];
                 lastSel.row_focus = lastCellUpdate[0];
                 lastSel.column_focus = lastCellUpdate[1];
@@ -751,6 +842,7 @@ const FxEditor: React.FC = () => {
               break;
             }
             case 'Escape': {
+              returnToFormulaOriginSheet(draftCtx);
               cancelNormalSelected(draftCtx);
               moveHighlightCell(draftCtx, 'down', 0, 'rangeOfSelect');
               // $("#luckysheet-functionbox-cell").blur();
@@ -1123,7 +1215,7 @@ const FxEditor: React.FC = () => {
           {/* <SVGIcon name="fx" width={18} height={18} /> */}
           <LucideIcon
             name="DSheetOnlyText"
-            fill="black"
+            fill="hsl(var(--color-text-default))"
             style={{
               width: '14px',
               height: '14px',
@@ -1251,7 +1343,7 @@ const FxEditor: React.FC = () => {
                       >
                         <LucideIcon
                           name="DSheetTextDisabled"
-                          fill="black"
+                          fill="hsl(var(--color-text-default))"
                           style={{
                             width: '14px',
                             height: '14px',

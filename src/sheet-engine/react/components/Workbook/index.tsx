@@ -1,3 +1,4 @@
+import { toast } from '@fileverse/ui';
 import {
   defaultContext,
   defaultSettings,
@@ -21,19 +22,70 @@ import {
   // locale,
   // calcSelectionInfo,
   groupValuesRefresh,
+  runFormulaEvalChunk,
+  applyWorkerFormulaChunkResults,
   insertDuneChart,
   getFlowdata,
   api,
   handlePasteByClick,
+  insertImage,
+  loadImageFromFile,
+  isAllowEdit,
+  copyActiveImage,
+  cutActiveImage,
+  pasteImageItem,
+  getImageClipboard,
+  getImageCutSourceId,
   update, // formatting helper
   loadLocale,
   defaultLuckysheetSelectRanges,
   updateContextWithSheetData,
+  jfrefreshgrid,
 } from '@sheet-engine/core';
+import { clearMeasureTextCache } from '@sheet-engine/core/modules/text';
+import {
+  applyCellFormatRangesToData,
+  getCellFormatRangeGridBounds,
+} from '@sheet-engine/core/utils/range-format';
+import { applyMergeConfigToData } from '@sheet-engine/core/utils/merge-hydrate';
+import {
+  activePalette,
+  setActiveGridPalette,
+  type ThemeKey,
+} from '@sheet-engine/core/theme';
 import {
   normalizeDateBaseLocale,
   setDateBaseLocale,
 } from '@sheet-engine/core/modules/date-base-locale';
+import {
+  isBrowserZoomShortcut,
+  isFindReplaceShortcut,
+  isFindShortcut,
+  isInsertDateShortcut,
+  isInsertDateTimeShortcut,
+  isInsertTimeShortcut,
+  isSelectAllShortcut,
+  isUsInsertDateTimeQuoteShortcut,
+  matchUndoRedoShortcut,
+} from '@sheet-engine/core/events/keyboard-shortcut-utils';
+import {
+  FORMULA_ASYNC_CHUNK_SIZE,
+  FORMULA_WORKER_CHUNK_SIZE,
+  FORMULA_WORKER_THRESHOLD,
+  isFormulaExecutionDebugEnabled,
+  isFormulaWorkerUnsafe,
+} from '@sheet-engine/core/modules/formula-async-eval';
+import {
+  buildWorkerEvalInput,
+  evalFormulasInBackground,
+  initFormulaWorkerSnapshot,
+  invalidateFormulaWorkerSnapshot,
+} from '@sheet-engine/core/modules/formula-worker-bridge';
+import { syncAndDemoteInactiveFlowdata } from '@sheet-engine/core/api/sheet-flowdata-lifecycle';
+import { ensureSheetFlowdata } from '@sheet-engine/core/api/sheet';
+import { setActiveDraftContext } from '@sheet-engine/core/utils/active-draft-context';
+import { clearRangeValuePassCache } from '@sheet-engine/core/modules/formula-range-cache';
+import { selectionCache } from '@sheet-engine/core/modules/selection';
 import React, {
   useMemo,
   useState,
@@ -65,6 +117,11 @@ import { ModalProvider } from '../../context/modal';
 import FilterMenu from '../ContextMenu/FilterMenu';
 import SheetList from '../SheetList';
 import DunePreview from '../DunePreview/DunePreview';
+import {
+  SidebarPanelPortals,
+  type SidebarPortalRegistryHandle,
+  type SidebarPortalRenderer,
+} from '../SidebarPanelPortals';
 // import ConditionRules from "../ConditionFormat/ConditionRules";
 
 enablePatches();
@@ -73,6 +130,11 @@ export type WorkbookInstance = ReturnType<typeof generateAPIs>;
 
 type AdditionalProps = {
   onOp?: (op: Op[]) => void;
+  sidebarActivePanel?: string | null;
+  sidebarPortalRegistry?: SidebarPortalRegistryHandle | null;
+  sidebarPortalRenderers?: Record<string, SidebarPortalRenderer>;
+  toolbarTrailingContent?: React.ReactNode;
+  theme?: ThemeKey;
 };
 
 const triggerGroupValuesRefresh = (ctx: Context) => {
@@ -89,8 +151,71 @@ const concatProducer = (...producers: ((ctx: Context) => void)[]) => {
   };
 };
 
+/**
+ * Undo/redo patches target dense `data` paths. After demote-on-switch a sheet
+ * may only have sparse celldata — hydrate first so applyPatches doesn't crash
+ * or write into a missing matrix. Mutates ctx: must be called on an immer
+ * draft, never on frozen state.
+ */
+function ensureFlowdataForDataPatches(ctx: Context, patches: Patch[]) {
+  const seen = new Set<number>();
+  for (let i = 0; i < patches.length; i += 1) {
+    const path = patches[i].path as (string | number)[];
+    if (path?.[0] !== 'luckysheetfile') continue;
+    const sheetIndex = path[1];
+    if (!_.isNumber(sheetIndex) || path[2] !== 'data') continue;
+    if (seen.has(sheetIndex)) continue;
+    seen.add(sheetIndex);
+    const sheet = ctx.luckysheetfile?.[sheetIndex];
+    if (sheet && !sheet.data?.length) {
+      ensureSheetFlowdata(ctx, { index: sheetIndex });
+    }
+  }
+}
+
+/** In-cell / formula-bar editors that must still receive workbook key handling. */
+function isSheetEditorElement(el: HTMLElement | null | undefined): boolean {
+  if (!el || typeof el.closest !== 'function') return false;
+  return !!(
+    el.id === 'luckysheet-rich-text-editor' ||
+    el.id === 'luckysheet-functionbox-cell' ||
+    el.closest('#luckysheet-rich-text-editor') ||
+    el.closest('#luckysheet-functionbox-cell') ||
+    el.classList?.contains('fortune-fx-input') ||
+    el.closest('.fortune-fx-input')
+  );
+}
+
+/**
+ * Sidebar portals (named ranges, data verification, …) render outside the
+ * workbook DOM but still bubble through React to Workbook's onKeyDown. Skip
+ * type-to-edit / focus-steal for real form fields in those panels.
+ */
+function isPortaledUiTextField(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  if (isSheetEditorElement(el)) return false;
+  const tag = el.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (el.isContentEditable) return true;
+  return false;
+}
+
 const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
-  ({ onOp, data: originalData, isFlvReadOnly, ...props }, ref) => {
+  (
+    {
+      onOp,
+      data: originalData,
+      isFlvReadOnly,
+      sidebarActivePanel = null,
+      sidebarPortalRegistry = null,
+      sidebarPortalRenderers = {},
+      toolbarTrailingContent,
+      theme,
+      ...props
+    },
+    ref,
+  ) => {
     const globalCache = useRef<GlobalCache>({ undoList: [], redoList: [] });
     const cellInput = useRef<HTMLDivElement>(null);
     const fxInput = useRef<HTMLDivElement>(null);
@@ -99,6 +224,7 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
     const scrollbarY = useRef<HTMLDivElement>(null);
     const cellArea = useRef<HTMLDivElement>(null);
     const workbookContainer = useRef<HTMLDivElement>(null);
+    const workbookInstanceRef = useRef<WorkbookInstance | null>(null);
 
     const refs: RefValues = useMemo(
       () => ({
@@ -115,6 +241,9 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
     );
 
     const [context, setContext] = useState(defaultContext(refs));
+    const contextRef = useRef(context);
+    contextRef.current = context;
+    const prevSheetIdRef = useRef<string | null>(null);
     // const { formula } = locale(context);
 
     const [moreToolbarItems, setMoreToolbarItems] =
@@ -172,6 +301,13 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
           lastRowNum = Math.max(lastRowNum, draftCtx.defaultrowNum);
           lastColNum = Math.max(lastColNum, draftCtx.defaultcolumnNum);
         }
+        const rangeBounds = getCellFormatRangeGridBounds(
+          newData.config?.cellFormatRanges,
+        );
+        if (rangeBounds) {
+          lastRowNum = Math.max(lastRowNum, rangeBounds.maxRow + 1);
+          lastColNum = Math.max(lastColNum, rangeBounds.maxCol + 1);
+        }
         if (lastRowNum && lastColNum) {
           const expandedData: SheetType['data'] = _.times(lastRowNum, () =>
             _.times(lastColNum, () => null),
@@ -194,6 +330,11 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
               }
             }
           });
+          applyCellFormatRangesToData(
+            expandedData,
+            newData.config?.cellFormatRanges,
+          );
+          applyMergeConfigToData(expandedData, newData.config?.merge);
           draftCtx.luckysheetfile = produce(draftCtx.luckysheetfile, (d) => {
             d[index!].data = expandedData;
             delete d[index!].celldata;
@@ -222,7 +363,7 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
 
     const emitYjsFromPatches = useCallback(
       (ctxBefore: Context, ctxAfter: Context, patches: Patch[]) => {
-        const { updateCellYdoc, updateAllCell } = ctxBefore.hooks ?? {};
+        const { updateCellYdoc } = ctxBefore.hooks ?? {};
         if (!updateCellYdoc) return;
 
         const mapFields = new Set([
@@ -235,13 +376,14 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
           'conditionRules',
         ]);
 
-        // De-dupe: last patch wins for the same (sheetId + path[0] + key).
+        // De-dupe: last patch wins for the same (sheetId + path + key).
         const changeMap = new Map<string, any>();
 
         const upsert = (change: any) => {
-          const k = `${change.sheetId}:${change.path?.[0] ?? ''}:${
-            change.key ?? ''
-          }`;
+          const pathKey = Array.isArray(change.path)
+            ? change.path.join('.')
+            : String(change.path ?? '');
+          const k = `${change.sheetId}:${pathKey}:${change.key ?? ''}`;
           changeMap.set(k, change);
         };
 
@@ -286,8 +428,10 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
               const r = path[3] as number;
               const beforeRow = (sheetBefore as any)?.data?.[r] ?? [];
               const afterRow = (sheetAfter as any)?.data?.[r] ?? [];
+              if (beforeRow === afterRow) return;
               const max = Math.max(beforeRow.length ?? 0, afterRow.length ?? 0);
               for (let c = 0; c < max; c += 1) {
+                if (beforeRow[c] === afterRow[c]) continue;
                 if (!_.isEqual(beforeRow[c] ?? null, afterRow[c] ?? null)) {
                   upsertCell(sheetId, r, c);
                 }
@@ -295,26 +439,30 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
               return;
             }
 
-            // Whole-matrix replacement ["data"] (rare). If huge, fall back to updateAllCell when available.
+            // Whole-matrix replacement ["data"] (rare). Diff row-by-row instead of full-sheet rewrite.
             if (path.length === 3) {
               const dataAfter = (sheetAfter as any)?.data as
                 | any[][]
                 | undefined;
+              const dataBefore = (sheetBefore as any)?.data as
+                | any[][]
+                | undefined;
               const rows = dataAfter?.length ?? 0;
-              const cols = rows > 0 ? (dataAfter?.[0]?.length ?? 0) : 0;
-              const size = rows * cols;
-              if (size > 50000 && updateAllCell) {
-                updateAllCell(sheetId);
-                return;
+              if (rows > 50000) {
+                console.warn(
+                  `[Yjs] undo/redo whole-matrix diff on large sheet (${rows} rows)`,
+                );
               }
               for (let r = 0; r < rows; r += 1) {
-                const beforeRow = (sheetBefore as any)?.data?.[r] ?? [];
-                const afterRow = (sheetAfter as any)?.data?.[r] ?? [];
+                const beforeRow = dataBefore?.[r] ?? [];
+                const afterRow = dataAfter?.[r] ?? [];
+                if (beforeRow === afterRow) continue;
                 const max = Math.max(
                   beforeRow.length ?? 0,
                   afterRow.length ?? 0,
                 );
                 for (let c = 0; c < max; c += 1) {
+                  if (beforeRow[c] === afterRow[c]) continue;
                   if (!_.isEqual(beforeRow[c] ?? null, afterRow[c] ?? null)) {
                     upsertCell(sheetId, r, c);
                   }
@@ -336,6 +484,36 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
                 type:
                   p.op === 'remove' || p.value == null ? 'delete' : 'update',
               });
+            }
+            return;
+          }
+
+          // Undo/redo of empty-cell formats (toolbar + paste) live here.
+          // afterConfigChanges also syncs, but emit on patch so peers never miss CFR.
+          if (root === 'config') {
+            const configKey = path[3];
+            if (
+              path.length === 3 ||
+              configKey === 'cellFormatRanges' ||
+              configKey === 'borderInfo'
+            ) {
+              const cfgAfter = sheetAfter?.config;
+              if (path.length === 3 || configKey === 'cellFormatRanges') {
+                upsert({
+                  sheetId,
+                  path: ['config', 'cellFormatRanges'],
+                  value: cfgAfter?.cellFormatRanges ?? [],
+                  type: 'update',
+                });
+              }
+              if (path.length === 3 || configKey === 'borderInfo') {
+                upsert({
+                  sheetId,
+                  path: ['config', 'borderInfo'],
+                  value: cfgAfter?.borderInfo ?? [],
+                  type: 'update',
+                });
+              }
             }
           }
         });
@@ -414,16 +592,23 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
     const setContextWithProduce = useCallback(
       (recipe: (ctx: Context) => void, options: SetContextOptions = {}) => {
         setContext((ctx_) => {
+          const runWithDraft = (draft: Context) => {
+            setActiveDraftContext(draft);
+            try {
+              recipe(draft);
+              triggerGroupValuesRefresh(draft);
+            } finally {
+              setActiveDraftContext(null);
+            }
+          };
+
           if (options.noHistory) {
-            return produce(
-              ctx_,
-              concatProducer(recipe, triggerGroupValuesRefresh),
-            );
+            return produce(ctx_, runWithDraft);
           }
 
           const [result, patches, inversePatches] = produceWithPatches(
             ctx_,
-            concatProducer(recipe, triggerGroupValuesRefresh),
+            runWithDraft,
           );
           if (patches.length > 0) {
             if (options.logPatch) {
@@ -489,7 +674,9 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
       if (history) {
         setContext((ctx_) => {
           const isBorderUndo = history.patches.some(
-            (onePatch) => onePatch.value?.borderInfo,
+            (onePatch) =>
+              Array.isArray(onePatch.value?.borderInfo) &&
+              onePatch.value.borderInfo.length > 0,
           );
 
           if (history.options?.deleteSheetOp) {
@@ -512,7 +699,10 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
               } as Patch);
             });
           }
-          const newContext = applyPatches(ctx_, history.inversePatches);
+          ctx_ = produce(ctx_, (draft: Context) => {
+            ensureFlowdataForDataPatches(draft, history.inversePatches);
+          });
+          let newContext = applyPatches(ctx_, history.inversePatches);
           globalCache.current.redoList.push(history);
           const inversedOptions = inverseRowColOptions(history.options);
           if (inversedOptions?.insertRowColOp) {
@@ -534,7 +724,17 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
             delete inversedOptions!.addSheet!.value!.data;
           }
           emitOp(newContext, history.inversePatches, inversedOptions, true);
-          emitYjsFromPatches(ctx_, newContext, history.inversePatches);
+          // Emit with a mutable draft as the active context: state is frozen
+          // by immer, and cellFormatRanges mirror commits write into the
+          // active draft during emission.
+          newContext = produce(newContext, (draft: Context) => {
+            setActiveDraftContext(draft);
+            try {
+              emitYjsFromPatches(ctx_, draft, history.inversePatches);
+            } finally {
+              setActiveDraftContext(null);
+            }
+          });
           // Sync ctx.config from current sheet after applying inverse patches.
           // This ensures components watching context.config (e.g. Sheet.tsx which
           // recalculates visibledatacolumn) react correctly to config changes.
@@ -570,14 +770,29 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
       const history = globalCache.current.redoList.pop();
       if (history) {
         setContext((ctx_) => {
-          const newContext = applyPatches(ctx_, history.patches);
+          ctx_ = produce(ctx_, (draft: Context) => {
+            ensureFlowdataForDataPatches(draft, history.patches);
+          });
+          let newContext = applyPatches(ctx_, history.patches);
           const isBorderUndo = history.patches.some(
-            (onePatch) => onePatch.value?.borderInfo,
+            (onePatch) =>
+              Array.isArray(onePatch.value?.borderInfo) &&
+              onePatch.value.borderInfo.length > 0,
           );
 
           globalCache.current.undoList.push(history);
           emitOp(newContext, history.patches, history.options);
-          emitYjsFromPatches(ctx_, newContext, history.patches);
+          // Emit with a mutable draft as the active context: state is frozen
+          // by immer, and cellFormatRanges mirror commits write into the
+          // active draft during emission.
+          newContext = produce(newContext, (draft: Context) => {
+            setActiveDraftContext(draft);
+            try {
+              emitYjsFromPatches(ctx_, draft, history.patches);
+            } finally {
+              setActiveDraftContext(null);
+            }
+          });
           // Sync ctx.config from current sheet after applying patches.
           const sheetIdxAfterRedo = getSheetIndex(
             newContext,
@@ -593,16 +808,22 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
               : {}),
           };
           if (isBorderUndo) {
-            const nwborderlist = (nw?.config?.borderInfo ?? []).concat(
-              history.patches[0].value?.borderInfo[0],
-            );
-            nw = {
-              ...nw,
-              config: {
-                ...nw.config,
-                borderInfo: nwborderlist,
-              },
-            };
+            // patches[0] is often a cell/data patch — only read borderInfo from
+            // a patch that actually has it, and guard [0] (a?.b[0] still throws).
+            const borderEntry = history.patches.find(
+              (p) => p.value?.borderInfo != null,
+            )?.value?.borderInfo?.[0];
+            if (borderEntry != null) {
+              nw = {
+                ...nw,
+                config: {
+                  ...nw.config,
+                  borderInfo: (nw?.config?.borderInfo ?? []).concat(
+                    borderEntry,
+                  ),
+                },
+              };
+            }
           }
           return nw;
         });
@@ -633,6 +854,9 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
         const scrollBar = document.getElementsByClassName(
           'luckysheet-scrollbar-x',
         )[0] as HTMLElement;
+        const addRowBar = document.getElementById(
+          'luckysheet-bottom-controll-row',
+        );
         if (denominatedUsed && denoWarn) {
           denoWarn.style.display = 'block';
           denoWarn.style.left = '0px';
@@ -642,6 +866,10 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
               'bottom: 36px !important; width: calc(100% - 60px);',
             );
           }
+          // Lift add-row bar so its white band sits directly on top of the disclaimer bar (no grid gap).
+          if (addRowBar) {
+            addRowBar.style.bottom = '54px';
+          }
         } else if (!denominatedUsed && denoWarn) {
           denoWarn.style.display = 'none';
           denoWarn.style.left = '-9999px';
@@ -650,6 +878,9 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
               'style',
               'bottom: 10px !important; width: calc(100% - 60px);',
             );
+          }
+          if (addRowBar) {
+            addRowBar.style.bottom = '38px';
           }
         }
         return ctx;
@@ -691,6 +922,49 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
         context.hooks.sheetLengthChange();
       }
     }, [context.luckysheetfile.length]);
+
+    // Repaint the canvas grid when the theme changes. Chrome themes via CSS cascade off the
+    // <html> class, but the grid is JS-painted and can't read CSS vars — so swap the active
+    // palette and force a full-grid redraw. No remount (that would lose scroll/selection).
+    useEffect(() => {
+      const changed = setActiveGridPalette(theme);
+      // Publish the resolved grid palette as CSS vars so DOM overlays that must match the
+      // canvas exactly — the in-cell editor box — read the same value the canvas paints with
+      // (not the ui chrome token, which may differ slightly). Set on every run (incl. mount)
+      // so the vars exist even when the theme never changes from the default.
+      const root = document.documentElement;
+      root.style.setProperty('--grid-cell-bg', activePalette.cellBg);
+      root.style.setProperty('--grid-cell-text', activePalette.cellText);
+      if (changed) {
+        setContextWithProduce((draftCtx) => {
+          jfrefreshgrid(draftCtx, null, undefined);
+        });
+      }
+    }, [theme, setContextWithProduce]);
+
+    // Webfonts (e.g. Calibri → Carlito) may resolve after the first canvas paint.
+    // Reload Calibri and redraw so committed cells don't stay stuck on the Arial fallback.
+    useEffect(() => {
+      if (typeof document === 'undefined' || !document.fonts?.load) return;
+      let cancelled = false;
+      const refreshAfterFonts = () => {
+        if (cancelled) return;
+        clearMeasureTextCache();
+        setContextWithProduce((draftCtx) => {
+          jfrefreshgrid(draftCtx, null, undefined);
+        });
+      };
+      Promise.all([
+        document.fonts.load('10pt "Calibri"'),
+        document.fonts.load('bold 10pt "Calibri"'),
+        document.fonts.ready,
+      ])
+        .then(refreshAfterFonts)
+        .catch(() => {});
+      return () => {
+        cancelled = true;
+      };
+    }, [setContextWithProduce]);
 
     const currentSheet = useMemo(() => {
       return context?.luckysheetfile?.find(
@@ -856,11 +1130,8 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
                 ensureSheetIndex(draftData, mergedSettings.generateSheetId);
               });
               draftCtx.luckysheetfile = newData;
-              newData.forEach((newDatum) => {
-                const index = getSheetIndex(draftCtx, newDatum.id!) as number;
-                const sheet = draftCtx.luckysheetfile?.[index];
-                initSheetData(draftCtx, sheet, index);
-              });
+              // Inactive tabs stay sparse (celldata only). The active sheet is
+              // hydrated below once currentSheetId is resolved.
             }
             if (mergedSettings.devicePixelRatio > 0) {
               draftCtx.devicePixelRatio = mergedSettings.devicePixelRatio;
@@ -886,6 +1157,22 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
             }
             if (sheetIdx == null) return;
 
+            const activeSheetId = draftCtx.currentSheetId;
+            const previousSheetId = prevSheetIdRef.current;
+            if (!_.isEmpty(draftCtx.luckysheetfile) && activeSheetId) {
+              if (previousSheetId !== activeSheetId) {
+                syncAndDemoteInactiveFlowdata(
+                  draftCtx,
+                  activeSheetId,
+                  previousSheetId,
+                );
+                if (previousSheetId) {
+                  invalidateFormulaWorkerSnapshot();
+                }
+              }
+              prevSheetIdRef.current = activeSheetId;
+            }
+
             const sheet = draftCtx.luckysheetfile?.[sheetIdx];
             if (!sheet) return;
 
@@ -902,7 +1189,10 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
               _.isEmpty(draftCtx.luckysheet_select_save) &&
               !_.isEmpty(sheet.luckysheet_select_save)
             ) {
-              draftCtx.luckysheet_select_save = sheet.luckysheet_select_save;
+              // Clone — sheet selection may be Immer-frozen from a prior produce.
+              draftCtx.luckysheet_select_save = _.cloneDeep(
+                sheet.luckysheet_select_save,
+              );
             }
             if (
               !mergedSettings.suppressInitialCellSelection &&
@@ -953,11 +1243,7 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
             }
 
             const finalData = draftCtx.luckysheetfile[sheetIdx]?.data ?? data;
-            if (
-              finalData &&
-              finalData.length > 0 &&
-              draftCtx.luckysheet_select_save?.length
-            ) {
+            if (finalData && finalData.length > 0) {
               updateContextWithSheetData(draftCtx, finalData);
             }
           },
@@ -997,10 +1283,114 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
     let waitingForDelRow = false;
     let resetDeleteRowTimer: any;
 
+    useEffect(() => {
+      const isExternalTextFocus = (root: HTMLDivElement | null) => {
+        const active = document.activeElement;
+        if (
+          !active ||
+          active === document.body ||
+          active === document.documentElement
+        ) {
+          return false;
+        }
+        if (root?.contains(active)) return false;
+        const tag = active.tagName;
+        return (
+          tag === 'INPUT' ||
+          tag === 'TEXTAREA' ||
+          (active as HTMLElement).isContentEditable
+        );
+      };
+
+      const onWindowInsertShortcut = (e: KeyboardEvent) => {
+        const root = workbookContainer.current;
+        if (!root || isExternalTextFocus(root)) return;
+
+        const isSheetShortcut =
+          isInsertDateShortcut(e) ||
+          isInsertTimeShortcut(e) ||
+          isInsertDateTimeShortcut(e) ||
+          isUsInsertDateTimeQuoteShortcut(e) ||
+          isFindShortcut(e) ||
+          isFindReplaceShortcut(e) ||
+          isSelectAllShortcut(e);
+        if (!isSheetShortcut) return;
+
+        setContextWithProduce((draftCtx) => {
+          handleGlobalKeyDown(
+            draftCtx,
+            cellInput.current!,
+            fxInput.current!,
+            e,
+            globalCache.current!,
+            handleUndo,
+            handleRedo,
+            canvas.current!.getContext('2d')!,
+          );
+        });
+
+        if (e.defaultPrevented) {
+          e.stopImmediatePropagation();
+          e.stopPropagation();
+        }
+      };
+
+      window.addEventListener('keydown', onWindowInsertShortcut, true);
+      return () =>
+        window.removeEventListener('keydown', onWindowInsertShortcut, true);
+    }, [handleRedo, handleUndo, setContextWithProduce]);
+
     const onKeyDown = useCallback(
       (e: React.KeyboardEvent<HTMLDivElement>) => {
-        // @ts-expect-error later
-        const { getSelection, getSheet, setSelection } = ref.current;
+        const { nativeEvent } = e;
+        if (isBrowserZoomShortcut(nativeEvent)) return;
+
+        // Portaled sidebar inputs bubble here via React, not DOM ancestry.
+        if (isPortaledUiTextField(e.target)) return;
+
+        // Floating-image clipboard shortcuts first — must run before the
+        // Alt+I then C insert-column chord, which also listens for KeyC.
+        if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey) {
+          const draftSnapshot = contextRef.current;
+          const activeImgId = draftSnapshot.activeImg;
+          if (e.code === 'KeyC' && activeImgId != null) {
+            e.preventDefault();
+            e.stopPropagation();
+            setContextWithProduce((draftCtx) => {
+              copyActiveImage(draftCtx);
+            });
+            return;
+          }
+          if (
+            e.code === 'KeyX' &&
+            activeImgId != null &&
+            isAllowEdit(draftSnapshot) &&
+            !draftSnapshot.isFlvReadOnly
+          ) {
+            e.preventDefault();
+            e.stopPropagation();
+            setContextWithProduce((draftCtx) => {
+              cutActiveImage(draftCtx);
+            });
+            return;
+          }
+          if (
+            e.code === 'KeyV' &&
+            (getImageClipboard() || getImageCutSourceId()) &&
+            isAllowEdit(draftSnapshot) &&
+            !draftSnapshot.isFlvReadOnly
+          ) {
+            e.preventDefault();
+            e.stopPropagation();
+            setContextWithProduce((draftCtx) => {
+              pasteImageItem(draftCtx);
+            });
+            return;
+          }
+        }
+
+        const { getSelection, getSheet, setSelection } =
+          workbookInstanceRef.current as any;
         const currentSelection = getSelection()?.[0];
 
         // Mac: Cmd + Option + =/+ inserts based on full row/column selection.
@@ -1060,43 +1450,49 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
           return;
         }
         if (waitingForRInsertRow && (e.code === 'KeyR' || e.code === 'KeyC')) {
-          const direction = 'rightbottom';
-          let position;
-          let insertRowColOp: SetContextOptions['insertRowColOp'];
-          if (e.code === 'KeyR') {
-            position = getSelection()[0].row[1];
-            insertRowColOp = {
-              type: 'row',
-              index: position,
-              count: 1,
-              direction,
-              id: context.currentSheetId,
-            };
+          // Don't steal Ctrl/Cmd+C copy (or other modified C/R) for insert chord
+          if (e.metaKey || e.ctrlKey) {
+            waitingForRInsertRow = false;
+            clearTimeout(resetInsertRowTimer);
           } else {
-            position = getSelection()[0].column[1];
-            insertRowColOp = {
-              type: 'column',
-              index: position,
-              count: 1,
-              direction,
-              id: context.currentSheetId,
-            };
-          }
-          if (!position) return;
-          const range = context.luckysheet_select_save;
-          setContextWithProduce(
-            (draftCtx) => {
-              if (insertRowColOp) insertRowCol(draftCtx, insertRowColOp);
-              draftCtx.luckysheet_select_save = range;
-            },
-            {
-              insertRowColOp,
-            },
-          );
+            const direction = 'rightbottom';
+            let position;
+            let insertRowColOp: SetContextOptions['insertRowColOp'];
+            if (e.code === 'KeyR') {
+              position = getSelection()[0].row[1];
+              insertRowColOp = {
+                type: 'row',
+                index: position,
+                count: 1,
+                direction,
+                id: context.currentSheetId,
+              };
+            } else {
+              position = getSelection()[0].column[1];
+              insertRowColOp = {
+                type: 'column',
+                index: position,
+                count: 1,
+                direction,
+                id: context.currentSheetId,
+              };
+            }
+            if (!position) return;
+            const range = context.luckysheet_select_save;
+            setContextWithProduce(
+              (draftCtx) => {
+                if (insertRowColOp) insertRowCol(draftCtx, insertRowColOp);
+                draftCtx.luckysheet_select_save = range;
+              },
+              {
+                insertRowColOp,
+              },
+            );
 
-          waitingForRInsertRow = false;
-          clearTimeout(resetInsertRowTimer);
-          e.preventDefault();
+            waitingForRInsertRow = false;
+            clearTimeout(resetInsertRowTimer);
+            e.preventDefault();
+          }
         }
 
         // -------Delete-row-col--------
@@ -1184,31 +1580,24 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
           });
         }
 
-        const { nativeEvent } = e;
         // handling undo and redo ahead because handleUndo and handleRedo
         // themselves are calling setContext, and should not be nested
         // in setContextWithProduce.
-        if (
-          (e.ctrlKey || e.metaKey) &&
-          e.code === 'KeyZ' &&
+        // Layout-aware: `code` is the US physical slot, so AZERTY (Z on
+        // KeyW) / QWERTZ (Y and Z swapped) need the typed character instead.
+        const undoRedo =
           context.luckysheetCellUpdate.length === 0
-        ) {
-          if (e.shiftKey) {
-            handleRedo();
-          } else {
-            handleUndo();
-          }
+            ? matchUndoRedoShortcut(nativeEvent)
+            : null;
+        if (undoRedo === 'undo') {
+          handleUndo();
           e.stopPropagation();
           return;
         }
-        if (
-          (e.ctrlKey || e.metaKey) &&
-          e.code === 'KeyY' &&
-          context.luckysheetCellUpdate.length === 0
-        ) {
+        if (undoRedo === 'redo') {
           handleRedo();
           e.stopPropagation();
-          e.preventDefault();
+          if (!e.shiftKey) e.preventDefault();
           return;
         }
         setContextWithProduce((draftCtx) => {
@@ -1234,8 +1623,17 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
         const focusInSheetOverlay =
           typeof active?.closest === 'function' &&
           active.closest('.fortune-sheet-overlay') != null;
+        const focusInWorkbook =
+          active === workbookContainer.current ||
+          (typeof active?.closest === 'function' &&
+            active.closest('.fortune-container') === workbookContainer.current);
         // deal with multi instance case, only the focused sheet handles the paste
-        if (cellInput.current === active || focusInSheetOverlay) {
+        if (
+          cellInput.current === active ||
+          focusInSheetOverlay ||
+          focusInWorkbook ||
+          context.activeImg != null
+        ) {
           if (!startPaste) return;
           let { clipboardData } = e;
           if (!clipboardData) {
@@ -1243,6 +1641,27 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
             // for IE
             clipboardData = window.clipboardData;
           }
+
+          // System clipboard image file (async) — handle outside immer draft
+          const imageFile =
+            clipboardData?.files?.length === 1 &&
+            clipboardData.files[0].type.indexOf('image') > -1
+              ? clipboardData.files[0]
+              : null;
+          if (imageFile) {
+            if (!selectionCache.isPasteAction) return;
+            if (!isAllowEdit(context) || context.isFlvReadOnly) return;
+            selectionCache.isPasteAction = false;
+            e.preventDefault();
+            loadImageFromFile(imageFile).then((image) => {
+              if (!image) return;
+              setContextWithProduce((draftCtx) => {
+                insertImage(draftCtx, image);
+              });
+            });
+            return;
+          }
+
           const txtdata =
             clipboardData!.getData('text/html') ||
             clipboardData!.getData('text/plain');
@@ -1277,23 +1696,56 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
                   id: context.currentSheetId,
                 }
               : null;
-          setContextWithProduce(
-            (draftCtx) => {
-              try {
-                if (insertRowColOp) {
-                  insertRowCol(draftCtx, insertRowColOp);
-                  draftCtx.luckysheet_select_save = range;
+          const runPaste = (pasteEvent: ClipboardEvent) => {
+            setContextWithProduce(
+              (draftCtx) => {
+                try {
+                  if (insertRowColOp) {
+                    insertRowCol(draftCtx, insertRowColOp);
+                    draftCtx.luckysheet_select_save = range;
+                  }
+                  if (startPaste) {
+                    startPaste = false;
+                    handlePaste(draftCtx, pasteEvent);
+                  }
+                } catch (err: any) {
+                  console.error(err);
                 }
-                if (startPaste) {
-                  startPaste = false;
-                  handlePaste(draftCtx, e);
-                }
-              } catch (err: any) {
-                console.error(err);
-              }
-            },
-            insertRowColOp ? { insertRowColOp } : {},
-          );
+              },
+              insertRowColOp ? { insertRowColOp } : {},
+            );
+          };
+
+          // Large pastes block the main thread while cells are parsed/laid out.
+          // Show a toast, then defer the heavy work a frame so it can paint before
+          // the UI freezes. handlePaste only reads clipboardData.getData/files and
+          // preventDefault, so a captured-string synthetic event drives it after the
+          // native event is gone.
+          const LARGE_PASTE_BYTES = 500_000;
+          if (txtdata.length > LARGE_PASTE_BYTES) {
+            e.preventDefault();
+            const htmlData = clipboardData!.getData('text/html');
+            const plainData = clipboardData!.getData('text/plain');
+            const deferredEvent = {
+              clipboardData: {
+                getData: (type: string) =>
+                  type === 'text/html' ? htmlData : plainData,
+                files: { length: 0 },
+              },
+              preventDefault: () => {},
+            } as unknown as ClipboardEvent;
+            toast({
+              title: 'Large content paste in progress',
+              variant: 'warning',
+              showCloseButton: true,
+              duration: 30 * 1000,
+            });
+            requestAnimationFrame(() =>
+              requestAnimationFrame(() => runPaste(deferredEvent)),
+            );
+          } else {
+            runPaste(e);
+          }
         }
         setContextWithProduce((ctx: any) => {
           if (ctx.luckysheet_selection_range) {
@@ -1315,31 +1767,257 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
       };
     }, [onPaste]);
 
+    const isFormulaCalculating = !!context.isFormulaCalculating;
+    const formulaAsyncEvalTotal = context.formulaAsyncEval?.total;
+    const showFormulaExecutionDebug = isFormulaExecutionDebugEnabled();
+
+    // Drain deferred formula eval: main-thread chunks (small jobs) or Web Worker (large jobs).
+    useEffect(() => {
+      if (!isFormulaCalculating || formulaAsyncEvalTotal == null) {
+        return;
+      }
+
+      let cancelled = false;
+      let frameId: number | null = null;
+      let workerOnlyChunkStreak = 0;
+
+      const finishJobIfComplete = (draft: Context) => {
+        const job = draft.formulaAsyncEval;
+        if (!job || job.nextIndex < job.total) return;
+        draft.formulaCache.execFunctionExist = undefined;
+        clearRangeValuePassCache(draft.formulaCache);
+        draft.formulaCache.execFunctionGlobalData = null;
+        draft.formulaAsyncEval = null;
+        draft.isFormulaCalculating = false;
+      };
+
+      const waitForNextFrame = () =>
+        new Promise<void>((resolve) => {
+          frameId = requestAnimationFrame(() => {
+            frameId = null;
+            resolve();
+          });
+        });
+
+      const waitForMacrotask = () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        });
+
+      const drainLoop = async () => {
+        while (!cancelled) {
+          const job = contextRef.current.formulaAsyncEval;
+          if (!contextRef.current.isFormulaCalculating || !job) return;
+
+          const startIndex = job.nextIndex;
+          if (startIndex >= job.total) {
+            setContextWithProduce(
+              (draft) => {
+                finishJobIfComplete(draft);
+              },
+              { noHistory: true },
+            );
+            return;
+          }
+
+          const useWorker = job.total >= FORMULA_WORKER_THRESHOLD;
+          const firstFormulaUnsafe = isFormulaWorkerUnsafe(
+            job.formulaRunList[startIndex].calc_funcStr,
+          );
+          const useWorkerForChunk = useWorker && !firstFormulaUnsafe;
+          const maxChunkSize = useWorkerForChunk
+            ? FORMULA_WORKER_CHUNK_SIZE
+            : FORMULA_ASYNC_CHUNK_SIZE;
+          let chunkEnd = startIndex;
+          while (
+            chunkEnd < job.formulaRunList.length &&
+            chunkEnd - startIndex < maxChunkSize
+          ) {
+            const formulaUnsafe = isFormulaWorkerUnsafe(
+              job.formulaRunList[chunkEnd].calc_funcStr,
+            );
+            if (useWorker && formulaUnsafe !== firstFormulaUnsafe) {
+              break;
+            }
+            chunkEnd += 1;
+          }
+          const formulas = job.formulaRunList.slice(startIndex, chunkEnd);
+          const unsafeFormulaCount = formulas.filter((formula) =>
+            isFormulaWorkerUnsafe(formula.calc_funcStr),
+          ).length;
+          const startedAt = performance.now();
+          let processedByWorkerChunk = false;
+
+          if (useWorkerForChunk) {
+            try {
+              if (
+                !initFormulaWorkerSnapshot(
+                  contextRef.current,
+                  job.workerSnapshotKey,
+                )
+              ) {
+                throw new Error('Formula worker unavailable');
+              }
+              const input = buildWorkerEvalInput(contextRef.current, formulas);
+              const output = await evalFormulasInBackground(
+                job.workerSnapshotKey,
+                input,
+              );
+              if (cancelled) return;
+              setContextWithProduce(
+                (draft) => {
+                  const liveJob = draft.formulaAsyncEval;
+                  if (!liveJob || liveJob.nextIndex !== startIndex) return;
+                  applyWorkerFormulaChunkResults(
+                    draft,
+                    output,
+                    new Set(liveJob.impactedByCircular),
+                    new Set(liveJob.cycleNodes),
+                    liveJob.calcChainKeys,
+                    getFlowdata(draft),
+                  );
+                  const elapsed = performance.now() - startedAt;
+                  liveJob.nextIndex = chunkEnd;
+                  liveJob.debug = {
+                    mode: 'worker',
+                    lastChunkMs: elapsed,
+                    lastChunkSize: formulas.length,
+                    completedChunks: (liveJob.debug?.completedChunks ?? 0) + 1,
+                    fallbackChunks: liveJob.debug?.fallbackChunks ?? 0,
+                    workerAvailable: true,
+                    unsafeFormulaCount,
+                    workerFormulaCount: formulas.length,
+                    totalWorkerFormulas:
+                      (liveJob.debug?.totalWorkerFormulas ?? 0) +
+                      formulas.length,
+                    totalMainThreadFormulas:
+                      liveJob.debug?.totalMainThreadFormulas ?? 0,
+                    lastError: null,
+                  };
+                  finishJobIfComplete(draft);
+                },
+                { noHistory: true },
+              );
+              processedByWorkerChunk = true;
+            } catch (e) {
+              if (cancelled) return;
+              workerOnlyChunkStreak = 0;
+              const message = e instanceof Error ? e.message : String(e);
+              setContextWithProduce(
+                (draft) => {
+                  const liveJob = draft.formulaAsyncEval;
+                  if (!liveJob || liveJob.nextIndex !== startIndex) return;
+                  const fallbackChunkSize = Math.min(
+                    FORMULA_ASYNC_CHUNK_SIZE,
+                    formulas.length,
+                  );
+                  runFormulaEvalChunk(draft, liveJob, fallbackChunkSize);
+                  const elapsed = performance.now() - startedAt;
+                  liveJob.debug = {
+                    mode: 'fallback',
+                    lastChunkMs: elapsed,
+                    lastChunkSize: fallbackChunkSize,
+                    completedChunks: (liveJob.debug?.completedChunks ?? 0) + 1,
+                    fallbackChunks: (liveJob.debug?.fallbackChunks ?? 0) + 1,
+                    workerAvailable: false,
+                    unsafeFormulaCount,
+                    workerFormulaCount: 0,
+                    totalWorkerFormulas:
+                      liveJob.debug?.totalWorkerFormulas ?? 0,
+                    totalMainThreadFormulas:
+                      (liveJob.debug?.totalMainThreadFormulas ?? 0) +
+                      fallbackChunkSize,
+                    lastError: message,
+                  };
+                  finishJobIfComplete(draft);
+                },
+                { noHistory: true },
+              );
+            }
+          } else {
+            workerOnlyChunkStreak = 0;
+            setContextWithProduce(
+              (draft) => {
+                const liveJob = draft.formulaAsyncEval;
+                if (!liveJob || liveJob.nextIndex !== startIndex) return;
+                runFormulaEvalChunk(
+                  draft,
+                  liveJob,
+                  chunkEnd - liveJob.nextIndex,
+                );
+                const elapsed = performance.now() - startedAt;
+                liveJob.debug = {
+                  mode: 'main-thread',
+                  lastChunkMs: elapsed,
+                  lastChunkSize: formulas.length,
+                  completedChunks: (liveJob.debug?.completedChunks ?? 0) + 1,
+                  fallbackChunks: liveJob.debug?.fallbackChunks ?? 0,
+                  workerAvailable: useWorker,
+                  unsafeFormulaCount,
+                  workerFormulaCount: 0,
+                  totalWorkerFormulas: liveJob.debug?.totalWorkerFormulas ?? 0,
+                  totalMainThreadFormulas:
+                    (liveJob.debug?.totalMainThreadFormulas ?? 0) +
+                    formulas.length,
+                  lastError:
+                    useWorker && unsafeFormulaCount > 0
+                      ? `${unsafeFormulaCount} formula(s) in this chunk require the main formula engine`
+                      : null,
+                };
+                finishJobIfComplete(draft);
+              },
+              { noHistory: true },
+            );
+          }
+
+          if (processedByWorkerChunk) {
+            workerOnlyChunkStreak += 1;
+            if (workerOnlyChunkStreak >= 3) {
+              workerOnlyChunkStreak = 0;
+              await waitForNextFrame();
+            } else {
+              await waitForMacrotask();
+            }
+          } else {
+            await waitForNextFrame();
+          }
+        }
+      };
+
+      void drainLoop();
+
+      return () => {
+        cancelled = true;
+        if (frameId != null) {
+          cancelAnimationFrame(frameId);
+        }
+      };
+    }, [isFormulaCalculating, formulaAsyncEvalTotal, setContextWithProduce]);
+
     // expose APIs
-    useImperativeHandle(
-      ref,
-      () =>
-        generateAPIs(
-          context,
-          setContextWithProduce,
-          handleUndo,
-          handleRedo,
-          mergedSettings,
-          cellInput.current,
-          scrollbarX.current,
-          scrollbarY.current,
-          globalCache.current,
-          refs,
-        ),
-      [
+    useImperativeHandle(ref, () => {
+      const workbookInstance = generateAPIs(
         context,
         setContextWithProduce,
         handleUndo,
         handleRedo,
         mergedSettings,
-        globalCache,
-      ],
-    );
+        cellInput.current,
+        scrollbarX.current,
+        scrollbarY.current,
+        globalCache.current,
+        refs,
+      );
+      workbookInstanceRef.current = workbookInstance;
+      return workbookInstance;
+    }, [
+      context,
+      setContextWithProduce,
+      handleUndo,
+      handleRedo,
+      mergedSettings,
+      globalCache,
+    ]);
 
     const i = getSheetIndex(context, context.currentSheetId);
     if (i == null) {
@@ -1375,6 +2053,67 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
             onKeyDown={onKeyDown}
             tabIndex={-1}
           >
+            {showFormulaExecutionDebug &&
+              context.isFormulaCalculating &&
+              context.formulaAsyncEval && (
+                <div
+                  className="fortune-formula-calculating-indicator"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <div>
+                    Calculating formulas…{' '}
+                    {Math.min(
+                      context.formulaAsyncEval.nextIndex,
+                      context.formulaAsyncEval.total,
+                    )}
+                    /{context.formulaAsyncEval.total}
+                  </div>
+                  {context.formulaAsyncEval.debug && (
+                    <div className="fortune-formula-calculating-debug">
+                      <div>
+                        Mode: {context.formulaAsyncEval.debug.mode} | Last
+                        chunk: {context.formulaAsyncEval.debug.lastChunkSize} in{' '}
+                        {Math.round(context.formulaAsyncEval.debug.lastChunkMs)}
+                        ms
+                      </div>
+                      <div>
+                        Chunks: {context.formulaAsyncEval.debug.completedChunks}
+                      </div>
+                      <div>
+                        Fallbacks:{' '}
+                        {context.formulaAsyncEval.debug.fallbackChunks}
+                      </div>
+                      <div>
+                        Worker formulas total:{' '}
+                        {context.formulaAsyncEval.debug.totalWorkerFormulas}
+                      </div>
+                      <div>
+                        Main-engine formulas total:{' '}
+                        {context.formulaAsyncEval.debug.totalMainThreadFormulas}
+                      </div>
+                      <div>
+                        Worker:{' '}
+                        {context.formulaAsyncEval.debug.workerAvailable
+                          ? 'ok'
+                          : 'unavailable'}
+                      </div>
+                      {context.formulaAsyncEval.debug.unsafeFormulaCount >
+                        0 && (
+                        <div>
+                          Main-engine formulas this chunk:{' '}
+                          {context.formulaAsyncEval.debug.unsafeFormulaCount}
+                        </div>
+                      )}
+                      {context.formulaAsyncEval.debug.lastError && (
+                        <div className="fortune-formula-calculating-error">
+                          Last error: {context.formulaAsyncEval.debug.lastError}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             <SVGDefines currency={mergedSettings.currency} />
             <div className="fortune-workarea">
               {mergedSettings.showToolbar && (
@@ -1383,6 +2122,7 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
                   setMoreItems={setMoreToolbarItems}
                   onMoreToolbarItemsClose={onMoreToolbarItemsClose}
                   moreToolbarItems={moreToolbarItems}
+                  trailingContent={toolbarTrailingContent}
                 />
               )}
               {mergedSettings.showFormulaBar && (
@@ -1408,6 +2148,11 @@ const Workbook = React.forwardRef<WorkbookInstance, Settings & AdditionalProps>(
             <ContextMenu />
             <FilterMenu />
             <SheetTabContextMenu />
+            <SidebarPanelPortals
+              activePanel={sidebarActivePanel}
+              portalRegistry={sidebarPortalRegistry}
+              extraPortals={sidebarPortalRenderers}
+            />
             {context.showSheetList && <SheetList />}
             {!_.isEmpty(context.contextMenu) && (
               <div

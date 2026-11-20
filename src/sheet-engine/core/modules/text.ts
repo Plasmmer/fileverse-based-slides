@@ -4,6 +4,7 @@ import type { Context } from '../context';
 import { locale } from '../locale';
 import { Cell } from '../types';
 import { normalizedCellAttr } from './cell';
+import { activePalette } from '../theme';
 import { isInlineStringCell } from './inline-string';
 import { isRealNum } from './validation';
 
@@ -124,6 +125,13 @@ export function defaultFont(defaultFontSize: number) {
   return `normal normal normal ${defaultFontSize}pt "Helvetica Neue", Helvetica, Arial, "PingFang SC", "Hiragino Sans GB", "Heiti SC",  "WenQuanYi Micro Hei", sans-serif`;
 }
 
+/** Quote a CSS font-family token so canvas `ctx.font` parses it reliably. */
+function quoteFontFamily(name: string) {
+  const trimmed = name.replace(/["']/g, '').trim();
+  if (!trimmed) return trimmed;
+  return `"${trimmed}"`;
+}
+
 export function getFontSet(
   format: any,
   defaultFontSize: number,
@@ -156,41 +164,26 @@ export function getFontSet(
       fontAttr.push(`${Math.ceil(format.fs)}pt`);
     }
 
-    let fontSet = `"Helvetica Neue", Helvetica, Arial, "PingFang SC", "Hiragino Sans GB", "Heiti SC", "Microsoft YaHei", "WenQuanYi Micro Hei", sans-serif`;
+    const fallbackStack = `"Helvetica Neue", Helvetica, Arial, "PingFang SC", "Hiragino Sans GB", "Heiti SC", "Microsoft YaHei", "WenQuanYi Micro Hei", sans-serif`;
+    let fontSet = fallbackStack;
     if (ctx) {
       const { fontarray } = locale(ctx);
       if (!format.ff) {
-        fontSet = `${fontarray[0]},${fontSet}`;
+        const primary = quoteFontFamily(fontarray[0]);
+        fontSet = `${primary}, ${fallbackStack}`;
       } else {
-        let fontfamily = null;
-        if (ctx) {
-          if (isdatatypemulti(format.ff).num) {
-            fontfamily = fontarray[parseInt(format.ff, 10)];
-          } else {
-            // fontfamily = fontarray[fontjson[format.ff]];
-            fontfamily = format.ff;
-
-            fontfamily = fontfamily.replace(/"/g, '').replace(/'/g, '');
-
-            if (fontfamily.indexOf(' ') > -1) {
-              fontfamily = `"${fontfamily}"`;
-            }
-
-            // if (
-            //   fontfamily != null &&
-            //   document.fonts &&
-            //   !document.fonts.check(`12px ${fontfamily}`)
-            // ) {
-            //   menuButton.addFontTolist(fontfamily);
-            // }
-          }
-
-          // if (fontfamily == null) {
-          //   fontfamily = fontarray[0];
-          // }
+        let fontfamily: string | null = null;
+        if (isdatatypemulti(format.ff).num) {
+          fontfamily = fontarray[parseInt(format.ff, 10)];
+        } else {
+          fontfamily = String(format.ff).replace(/"/g, '').replace(/'/g, '');
         }
 
-        fontSet = `${fontfamily},${fontSet}`;
+        if (fontfamily) {
+          // Prefer the requested face only; keep a short generic fallback so a
+          // missing webfont doesn't silently paint as Helvetica Neue/Arial.
+          fontSet = `${quoteFontFamily(fontfamily)}, sans-serif`;
+        }
       }
     }
     return `${fontAttr.join(' ')} ${fontSet}`;
@@ -539,7 +532,7 @@ export function getCellTextInfo(
         if (newValue === '' && x !== splitArr.length - 1) {
           inlineStringArr.push({
             fontset: scfontset,
-            fc: !fc ? '#000' : fc,
+            fc: !fc ? activePalette.cellText : fc,
             cl: !cl ? 0 : cl,
             un: !un ? 0 : un,
             wrap: true,
@@ -550,7 +543,7 @@ export function getCellTextInfo(
           if (hasLink) {
             inlineStringArr.push({
               fontset: scfontset,
-              fc: !fc ? '#000' : fc,
+              fc: !fc ? activePalette.cellText : fc,
               cl: !cl ? 0 : cl,
               un: !un ? 0 : un,
               v: newValue,
@@ -569,7 +562,7 @@ export function getCellTextInfo(
 
               inlineStringArr.push({
                 fontset: scfontset,
-                fc: !fc ? '#000' : fc,
+                fc: !fc ? activePalette.cellText : fc,
                 cl: !cl ? 0 : cl,
                 un: !un ? 0 : un,
                 v: nv,
@@ -582,7 +575,7 @@ export function getCellTextInfo(
           if (x !== splitArr.length - 1) {
             inlineStringArr.push({
               fontset: scfontset,
-              fc: !fc ? '#000' : fc,
+              fc: !fc ? activePalette.cellText : fc,
               cl: !cl ? 0 : cl,
               un: !un ? 0 : un,
               wrap: true,
@@ -611,6 +604,10 @@ export function getCellTextInfo(
       }
     } else {
       value = cell;
+    }
+
+    if (typeof value === 'number') {
+      value = String(value);
     }
 
     if (_.isEmpty(value)) {

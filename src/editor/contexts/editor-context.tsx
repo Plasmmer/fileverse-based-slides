@@ -14,15 +14,45 @@ import * as Y from 'yjs';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { fromUint8Array } from 'js-base64';
 
+import { ySheetArrayToPlain } from '../utils/update-ydoc';
 import { useEditorSync } from '../hooks/use-editor-sync';
+import {
+  getWorkbookHydrationReason,
+  isLiveCollaborationSession,
+  shouldRehydrateWorkbookOnReady,
+} from '../hooks/collaboration-lifecycle';
+import { useCelldataCompaction } from '../hooks/use-celldata-compaction';
 import { useEditorData } from '../hooks/use-editor-data';
+import { navigateToSheet } from '../utils/navigate-to-sheet';
+import { activateSheetForLink } from '../utils/activate-sheet-for-link';
+import { createActiveSheetKeeper } from '../utils/active-sheet-keeper';
 import {
   updateRowIndices,
   updateColumnIndices,
 } from '../utils/update-index-after-drag';
-import { useEditorCollaboration } from '../hooks/use-editor-collaboration';
-import { DataBlockApiKeyHandlerType, SheetUpdateData } from '../types';
-
+import {
+  SheetUpdateData,
+  DataBlockEvent,
+  type DSheetEditorHandle,
+} from '../types';
+import type { CommentsConfig } from '../types/comments';
+import { ApiKeyStorage, defaultApiKeyStorage } from '../utils/api-key-storage';
+import type { OpenApiKeyModalFn } from '../utils/data-block-error-handler';
+import type { SmartContractConfig } from '../types/smart-contract';
+import {
+  useSmartContract,
+  type UseSmartContractReturn,
+} from '../hooks/use-smart-contract';
+import { SidebarProvider } from '../components/sidebar/sidebar-context';
+import { SidebarPortalRegistryProvider } from '../components/sidebar/sidebar-portal-registry';
+import type {
+  CollaborationProps,
+  CollabState,
+  CollabUser,
+} from '../../sync-local/types';
+import type { Awareness } from 'y-protocols/awareness';
+import type { DSheetContentSnapshot } from '../../persistence';
+import { attachDSheetEditorHandle } from '../utils/editor-handle';
 // Define the shape of the context
 export interface EditorContextType {
   setIsDataLoaded: React.Dispatch<React.SetStateAction<boolean>>;
@@ -39,6 +69,7 @@ export interface EditorContextType {
   refreshIndexedDB: () => Promise<void>;
   // Core refs
   sheetEditorRef: React.MutableRefObject<WorkbookInstance | null>;
+  setSheetEditorRef: React.RefCallback<WorkbookInstance>;
   ydocRef: React.MutableRefObject<Y.Doc | null>;
   persistenceRef: React.MutableRefObject<IndexeddbPersistence | null>;
 
@@ -52,20 +83,37 @@ export interface EditorContextType {
 
   // UI states
   loading: boolean;
+  isDataLoaded: boolean;
   forceSheetRender: number;
   setForceSheetRender: React.Dispatch<React.SetStateAction<number>>;
-
-  // Collaboration
-  activeUsers: string[];
-  collaborationStatus: 'disconnected' | 'connecting' | 'connected' | 'error';
 
   // Sync status
   syncStatus: 'initializing' | 'syncing' | 'synced' | 'error';
 
-  // For compatibility with types
-  isCollaborative?: boolean;
+  // Socket.IO collaboration
+  collabEnabled?: boolean;
+  isLiveCollabSession: boolean;
+  collabIsOwner?: boolean;
+  collabState?: CollabState;
+  isCollabReady?: boolean;
+  isCollabSyncing?: boolean;
+  hasCollabContentInitialised?: boolean;
+  awareness?: Awareness | null;
+  terminateSession?: () => void;
+  onCollaboratorsChange?: (collaborators: CollabUser[]) => void;
 
   handleLiveQuery: (subsheetIndex: number, data: LiveQueryData) => void;
+
+  apiKeyStorage: ApiKeyStorage;
+  onDataBlockEvent?: (event: DataBlockEvent) => void;
+  openApiKeyModal: OpenApiKeyModalFn;
+  apiKeyModalState: {
+    open: boolean;
+    apiKeyName: string;
+    onSave: (key: string) => void;
+    onClose: () => void;
+  } | null;
+  smartContract: UseSmartContractReturn;
 }
 
 // Create the context with a default value
@@ -73,9 +121,7 @@ const EditorContext = createContext<EditorContextType | undefined>(undefined);
 
 // Props for the provider component
 interface EditorProviderProps {
-  allowComments?: boolean;
   setSelectedTemplate?: React.Dispatch<React.SetStateAction<string>>;
-  setShowSmartContractModal?: React.Dispatch<React.SetStateAction<boolean>>;
   getDocumentTitle?: (dsheetId: string) => Promise<string>;
   updateDocumentTitle?: (title: string) => void;
   isAuthorized: boolean;
@@ -84,24 +130,40 @@ interface EditorProviderProps {
   username?: string;
   portalContent?: string;
   enableIndexeddbSync?: boolean;
-  enableWebrtc?: boolean;
   isReadOnly?: boolean;
+  onContentUpdate?: () => void;
   onChange?: (data: SheetUpdateData, encodedUpdate?: string) => void;
-  externalEditorRef?: React.MutableRefObject<WorkbookInstance | null>;
-  isCollaborative?: boolean;
-  commentData?: object;
+  collaboration?: CollaborationProps;
+  externalEditorRef?: React.Ref<DSheetEditorHandle>;
+  legacyEditorRef?: React.Ref<DSheetEditorHandle>;
+  commentsConfig?: CommentsConfig;
   editorStateRef?: React.MutableRefObject<{
     refreshIndexedDB: () => Promise<void>;
+    getContentSnapshot: () => DSheetContentSnapshot;
+    mergeContent: (encodedState: string) => DSheetContentSnapshot;
+    terminateSession?: () => void;
+    updateCollaboratorName?: (name: string) => void;
+    updateSessionTitle?: (args: {
+      encryptedTitle: string;
+      documentTitle: string;
+    }) => void;
+    rehydrateAfterCollabSync?: (reason?: string) => boolean;
   } | null>;
   enableLiveQuery?: boolean;
   liveQueryRefreshRate?: number;
-  dataBlockApiKeyHandler?: DataBlockApiKeyHandlerType;
+  apiKeyStorage?: ApiKeyStorage;
+  onDataBlockEvent?: (event: DataBlockEvent) => void;
+  smartContracts?: SmartContractConfig;
+  onContentSyncStatusChange?: (
+    status: 'initializing' | 'syncing' | 'synced' | 'error',
+  ) => void;
+  onCollaborationInitializationComplete?: (result: 'ready' | 'error') => void;
+  onIndexedDbError?: (error: Error) => void;
 }
 
 // Provider component that wraps the app
 export const EditorProvider: React.FC<EditorProviderProps> = ({
   setSelectedTemplate,
-  setShowSmartContractModal,
   getDocumentTitle,
   updateDocumentTitle,
   children,
@@ -109,25 +171,72 @@ export const EditorProvider: React.FC<EditorProviderProps> = ({
   username = 'Anonymous',
   portalContent = '',
   enableIndexeddbSync = true,
-  enableWebrtc = true,
   isReadOnly = false,
-  allowComments = false,
+  onContentUpdate,
   onChange,
   externalEditorRef,
-  isCollaborative = false,
-  commentData,
+  legacyEditorRef,
+  collaboration,
+  commentsConfig,
   isAuthorized,
   editorStateRef,
   enableLiveQuery,
   liveQueryRefreshRate,
-  dataBlockApiKeyHandler,
+  apiKeyStorage: apiKeyStorageProp,
+  onDataBlockEvent,
+  smartContracts,
+  onContentSyncStatusChange,
+  onCollaborationInitializationComplete,
+  onIndexedDbError,
 }) => {
+  // Comments are driven entirely by commentsConfig (the legacy
+  // commentData/allowComments props were removed).
+  const resolvedCommentData = commentsConfig?.commentsData;
+  const resolvedAllowComments = !!commentsConfig;
+
   const [forceSheetRender, setForceSheetRender] = useState<number>(1);
-  const internalEditorRef = useRef<WorkbookInstance | null>(null);
-  const sheetEditorRef = externalEditorRef || internalEditorRef;
+
+  const forceSheetRenderRef = useRef(forceSheetRender);
+  forceSheetRenderRef.current = forceSheetRender;
+  const dsheetIdRef = useRef(dsheetId);
+  dsheetIdRef.current = dsheetId;
+  const activeSheetKeeperRef = useRef(createActiveSheetKeeper());
+  const sheetEditorRef = useRef<WorkbookInstance | null>(null);
   const [dataBlockCalcFunction, setDataBlockCalcFunction] = useState<{
     [key: string]: { [key: string]: any };
   }>({});
+
+  const apiKeyStorage = useMemo(
+    () => apiKeyStorageProp ?? defaultApiKeyStorage,
+    [apiKeyStorageProp],
+  );
+
+  const smartContract = useSmartContract(smartContracts);
+
+  const [apiKeyModalState, setApiKeyModalState] = useState<{
+    open: boolean;
+    apiKeyName: string;
+    onSave: (key: string) => void;
+    onClose: () => void;
+  } | null>(null);
+
+  const openApiKeyModal = useCallback<OpenApiKeyModalFn>(
+    (apiKeyName, callbacks) => {
+      setApiKeyModalState({
+        open: true,
+        apiKeyName,
+        onSave: (key: string) => {
+          setApiKeyModalState(null);
+          callbacks.onSave(key);
+        },
+        onClose: () => {
+          setApiKeyModalState(null);
+          callbacks.onClose();
+        },
+      });
+    },
+    [],
+  );
 
   const updateDataBlockCalcFunctionAfterRowDrag = useCallback(
     (
@@ -187,44 +296,197 @@ export const EditorProvider: React.FC<EditorProviderProps> = ({
     };
   }, [updateDataBlockCalcFunctionAfterRowDrag]);
 
-  // Initialize YJS document and persistence
-  const { ydocRef, persistenceRef, syncStatus, isSyncedRef, refreshIndexedDB } =
-    useEditorSync(dsheetId, enableIndexeddbSync, isReadOnly);
+  // Stable pointer to the latest sheet data — populated by useEditorData below.
+  // Declared here so onCollabUpdate (which feeds into useEditorSync) can reference it
+  // without causing a TDZ issue or stale closure.
+  const currentDataForCollabRef = useRef<Sheet[]>([]);
 
-  useMemo(() => {
-    if (!editorStateRef) return;
-    editorStateRef.current = {
-      ...editorStateRef.current,
-      refreshIndexedDB,
-    };
-  }, [editorStateRef]);
+  const onCollabUpdateRef = useRef(onChange);
+  useEffect(() => {
+    onCollabUpdateRef.current = onChange;
+  }, [onChange]);
 
-  // Wrapper for onChange to handle type compatibility
-  const handleOnChangePortalUpdate = useMemo(() => {
-    if (!onChange) {
-      return () => {};
-    }
+  const handleContentUpdateNotification = useMemo(
+    () => throttle(() => onContentUpdate?.(), 1000),
+    [onContentUpdate],
+  );
 
-    return throttle(() => {
-      if (!ydocRef.current) return;
-      const encodedUpdate = fromUint8Array(
-        Y.encodeStateAsUpdate(ydocRef.current),
+  // Same-turn ydoc writes (celldata emit, then comment anchors) must encode
+  // together. A leading persist in the middle of that stack publishes new
+  // cells with old comment positions — viewers then show data that moved and
+  // triangles that did not.
+  const portalUpdateScheduledRef = useRef(false);
+
+  const rehydrateAfterCollabSyncRef = useRef<(reason: string) => boolean>(
+    () => false,
+  );
+
+  // onCollabUpdate: called by SyncManager when a remote update arrives.
+  const onCollabUpdate = useCallback(
+    (fullState: string) => {
+      if (!onCollabUpdateRef.current) return;
+      onCollabUpdateRef.current(
+        { data: currentDataForCollabRef.current },
+        fullState,
       );
-      onChange({ data: currentDataRef.current }, encodedUpdate);
-    }, 1000);
-  }, [onChange, dsheetId]);
+      handleContentUpdateNotification();
+    },
+    [handleContentUpdateNotification],
+  );
+
+  // Initialize YJS document, persistence, and optional Socket.IO collab transport
+  const {
+    ydocRef,
+    persistenceRef,
+    syncStatus,
+    isContentBootstrapReady,
+    refreshIndexedDB,
+    getContentSnapshot,
+    mergeContent,
+    collabState,
+    isCollabReady,
+    isCollabSyncing,
+    hasCollabContentInitialised,
+    awareness,
+    terminateSession,
+    updateTitle,
+  } = useEditorSync(
+    dsheetId,
+    enableIndexeddbSync,
+    isReadOnly,
+    portalContent,
+    collaboration,
+    onCollabUpdate,
+    onIndexedDbError,
+  );
+
+  // Let host apps gate collab start/resume on real sync completion.
+  useEffect(() => {
+    onContentSyncStatusChange?.(syncStatus);
+  }, [syncStatus, onContentSyncStatusChange]);
+
+  // Imperatively update the local collaborator's display name in awareness and
+  // re-broadcast so peers see the new name (mirrors ddoc's
+  // editorRef.current.updateCollaboratorName). Preserves color/isEns/cell.
+  const updateCollaboratorName = useCallback(
+    (name: string) => {
+      if (!awareness) return;
+      const local = awareness.getLocalState();
+      const prevUser = (local?.user as Record<string, unknown>) || {};
+      awareness.setLocalStateField('user', {
+        ...prevUser,
+        name,
+      });
+    },
+    [awareness],
+  );
+
+  const updateSessionTitle = useCallback(
+    (args: { encryptedTitle: string; documentTitle: string }) => {
+      updateTitle(args);
+    },
+    [updateTitle],
+  );
+
+  // Always-fresh refs let Fortune regenerate its WorkbookInstance without
+  // capturing stale collaboration methods in the composed imperative handle.
+  const refreshIndexedDBRef = useRef(refreshIndexedDB);
+  refreshIndexedDBRef.current = refreshIndexedDB;
+  const terminateSessionRef = useRef(terminateSession);
+  terminateSessionRef.current = terminateSession;
+  const updateCollaboratorNameRef = useRef(updateCollaboratorName);
+  updateCollaboratorNameRef.current = updateCollaboratorName;
+  const updateSessionTitleRef = useRef(updateSessionTitle);
+  updateSessionTitleRef.current = updateSessionTitle;
+
+  const setSheetEditorRef = useCallback<React.RefCallback<WorkbookInstance>>(
+    (workbook) => {
+      sheetEditorRef.current = workbook;
+      attachDSheetEditorHandle(
+        workbook,
+        {
+          refreshIndexedDB: () => refreshIndexedDBRef.current(),
+          terminateSession: () => terminateSessionRef.current(),
+          updateCollaboratorName: (name) =>
+            updateCollaboratorNameRef.current(name),
+          updateSessionTitle: (args) => updateSessionTitleRef.current(args),
+          navigateToSheet: (sheetId, opts) =>
+            navigateToSheet(
+              () => sheetEditorRef.current,
+              sheetId,
+              activateSheetForLink,
+              opts,
+            ),
+        },
+        [externalEditorRef, legacyEditorRef],
+      );
+      activeSheetKeeperRef.current.onAttach(
+        workbook,
+        `${dsheetIdRef.current}-${forceSheetRenderRef.current}`,
+      );
+    },
+    [externalEditorRef, legacyEditorRef],
+  );
+
+  const handleOnChange = useMemo(
+    () =>
+      throttle(() => {
+        if (!onChange || !ydocRef.current) return;
+
+        const encodedUpdate = fromUint8Array(
+          Y.encodeStateAsUpdate(ydocRef.current),
+        );
+        // Local cell edits update Yjs celldata but do not refresh currentDataRef.
+        // Build the legacy plain snapshot from Yjs only for hosts that still
+        // request onChange.
+        let plain = currentDataRef.current;
+        try {
+          const sheetArray = ydocRef.current.getArray(dsheetId);
+          plain = ySheetArrayToPlain(sheetArray as Y.Array<Y.Map<any>>);
+          currentDataRef.current = plain;
+        } catch {
+          // Fall back to ref if Yjs → plain conversion fails.
+        }
+        onChange({ data: plain }, encodedUpdate);
+      }, 1000),
+    [onChange, dsheetId],
+  );
+
+  useEffect(
+    () => () => {
+      handleContentUpdateNotification.cancel();
+      handleOnChange.cancel();
+    },
+    [handleOnChange, handleContentUpdateNotification],
+  );
+
+  const flushPortalUpdate = useCallback(() => {
+    handleOnChange();
+    handleOnChange.flush();
+    handleContentUpdateNotification();
+    handleContentUpdateNotification.flush();
+  }, [handleOnChange, handleContentUpdateNotification]);
+
+  const handleOnChangePortalUpdate = useCallback(() => {
+    if (portalUpdateScheduledRef.current) return;
+    portalUpdateScheduledRef.current = true;
+    queueMicrotask(() => {
+      portalUpdateScheduledRef.current = false;
+      flushPortalUpdate();
+    });
+  }, [flushPortalUpdate]);
 
   useEffect(() => {
     if (!onChange) return;
 
     const handleBeforeUnload = () => {
-      handleOnChangePortalUpdate();
+      flushPortalUpdate();
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload);
     };
-  }, [onChange, handleOnChangePortalUpdate]);
+  }, [onChange, flushPortalUpdate]);
 
   // Initialize sheet data
   const {
@@ -237,39 +499,105 @@ export const EditorProvider: React.FC<EditorProviderProps> = ({
     handleLiveQuery,
     initialiseLiveQueryData,
     setIsDataLoaded,
+    rehydrateWorkbookFromYdoc,
   } = useEditorData(
     ydocRef,
     dsheetId,
     sheetEditorRef,
     setForceSheetRender,
-    portalContent,
     isReadOnly,
     handleOnChangePortalUpdate,
     syncStatus,
-    commentData,
+    isContentBootstrapReady,
+    resolvedCommentData,
     dataBlockCalcFunction,
     setDataBlockCalcFunction,
     enableLiveQuery,
     liveQueryRefreshRate,
-    dataBlockApiKeyHandler,
-    allowComments,
+    apiKeyStorage,
+    openApiKeyModal,
+    onDataBlockEvent,
+    resolvedAllowComments,
+    collaboration?.enabled === true,
   );
 
-  // Initialize collaboration
-  const { collaborationStatus, activeUsers } = useEditorCollaboration(
-    ydocRef.current,
+  useCelldataCompaction({
     dsheetId,
-    username,
-    enableWebrtc,
-  );
+    ydocRef,
+    sheetEditorRef,
+    currentDataRef,
+    handleOnChangePortalUpdate,
+    syncStatus,
+    isDataLoaded,
+    isReadOnly,
+    remoteUpdateRef,
+    collabSyncing: isCollabSyncing,
+  });
 
-  // Force re-render when data changes
+  // Keep the stable collab ref in sync with the live currentDataRef
+  currentDataForCollabRef.current = currentDataRef.current;
+
+  rehydrateAfterCollabSyncRef.current = rehydrateWorkbookFromYdoc;
+
+  // Rebuild Fortune when peer state may differ. A fresh owner with no remote
+  // updates already has the authoritative workbook, so keeping that mount avoids
+  // losing selection on the first local edit. Reconnects and delegated sessions
+  // still rebuild from the fully merged Y.Doc.
+  const hasHydratedCollabReadyRef = useRef(false);
+  const initialSyncHadPeerUpdatesRef = useRef(false);
+  const previousCollabStatusRef = useRef<string | undefined>(undefined);
   useEffect(() => {
-    // If data is loaded from persistence but the sheet isn't rendered yet
-    if (isDataLoaded && syncStatus === 'synced' && isSyncedRef.current) {
-      setForceSheetRender((prev) => prev + 1);
+    const status = collabState?.status;
+    if (status === 'syncing' && collabState.hasUnmergedPeerUpdates) {
+      initialSyncHadPeerUpdatesRef.current = true;
     }
-  }, [isDataLoaded, syncStatus]);
+    const previous = previousCollabStatusRef.current;
+    previousCollabStatusRef.current = status;
+    const reason = getWorkbookHydrationReason(
+      status,
+      previous,
+      hasHydratedCollabReadyRef.current,
+    );
+    if (!reason) return;
+    const shouldRehydrate = shouldRehydrateWorkbookOnReady({
+      reason,
+      isOwner:
+        collaboration?.enabled === true && collaboration.connection.isOwner,
+      hasUnmergedPeerUpdates: initialSyncHadPeerUpdatesRef.current,
+    });
+    const initialized =
+      !shouldRehydrate || rehydrateAfterCollabSyncRef.current(reason);
+    if (initialized) {
+      hasHydratedCollabReadyRef.current = true;
+    }
+    if (reason === 'initial') {
+      onCollaborationInitializationComplete?.(initialized ? 'ready' : 'error');
+    }
+  }, [collabState, collaboration, onCollaborationInitializationComplete]);
+
+  // Expose rehydrate on the host-owned editorStateRef for explicit recovery.
+  useEffect(() => {
+    if (!editorStateRef) return;
+    editorStateRef.current = {
+      ...editorStateRef.current,
+      refreshIndexedDB,
+      getContentSnapshot,
+      mergeContent,
+      rehydrateAfterCollabSync: (reason = 'host') =>
+        rehydrateAfterCollabSyncRef.current(reason),
+      terminateSession,
+      updateCollaboratorName,
+      updateSessionTitle,
+    };
+  }, [
+    editorStateRef,
+    getContentSnapshot,
+    mergeContent,
+    refreshIndexedDB,
+    terminateSession,
+    updateCollaboratorName,
+    updateSessionTitle,
+  ]);
 
   // Loading state is based on data loading, sync status, and data availability in read-only mode
   const loading =
@@ -280,16 +608,23 @@ export const EditorProvider: React.FC<EditorProviderProps> = ({
     (isReadOnly &&
       (!currentDataRef.current || currentDataRef.current.length === 0));
 
+  const collabIsOwner = useMemo(() => {
+    if (collaboration?.enabled !== true) return true;
+    return collaboration.connection.isOwner;
+  }, [collaboration]);
+  const isLiveCollabSession = isLiveCollaborationSession(collaboration);
+
   // Create the context value
   const contextValue: EditorContextType = useMemo(() => {
     return {
       setSelectedTemplate,
-      setShowSmartContractModal,
+      setShowSmartContractModal: smartContract.setShowSmartContractModal,
       getDocumentTitle,
       updateDocumentTitle,
       dataBlockCalcFunction,
       setDataBlockCalcFunction,
       sheetEditorRef,
+      setSheetEditorRef,
       ydocRef,
       persistenceRef,
       sheetData,
@@ -298,28 +633,46 @@ export const EditorProvider: React.FC<EditorProviderProps> = ({
       remoteUpdateRef,
       handleChange,
       loading,
+      isDataLoaded,
       setIsDataLoaded,
       forceSheetRender,
       setForceSheetRender,
-      activeUsers,
-      collaborationStatus,
       syncStatus,
-      isCollaborative,
       isAuthorized,
       refreshIndexedDB,
       handleLiveQuery,
       initialiseLiveQueryData,
       isReadOnly,
       handleOnChangePortalUpdate,
+      // Socket.IO collab
+      collabEnabled: collaboration?.enabled === true,
+      isLiveCollabSession,
+      collabIsOwner,
+      collabState,
+      isCollabReady,
+      isCollabSyncing,
+      hasCollabContentInitialised,
+      awareness,
+      terminateSession,
+      onCollaboratorsChange:
+        collaboration?.enabled === true
+          ? collaboration.on?.onCollaboratorsChange
+          : undefined,
+      apiKeyStorage,
+      onDataBlockEvent,
+      openApiKeyModal,
+      apiKeyModalState,
+      smartContract,
     };
   }, [
     setIsDataLoaded,
-    setShowSmartContractModal,
+    smartContract,
     getDocumentTitle,
     updateDocumentTitle,
     dataBlockCalcFunction,
     setDataBlockCalcFunction,
     sheetEditorRef,
+    setSheetEditorRef,
     ydocRef,
     persistenceRef,
     sheetData,
@@ -328,21 +681,35 @@ export const EditorProvider: React.FC<EditorProviderProps> = ({
     remoteUpdateRef,
     handleChange,
     loading,
+    isDataLoaded,
     forceSheetRender,
     setForceSheetRender,
-    activeUsers,
-    collaborationStatus,
     syncStatus,
-    isCollaborative,
     isAuthorized,
     handleLiveQuery,
     initialiseLiveQueryData,
     isReadOnly,
+    collaboration?.enabled,
+    isLiveCollabSession,
+    collabIsOwner,
+    collabState,
+    isCollabReady,
+    isCollabSyncing,
+    hasCollabContentInitialised,
+    awareness,
+    terminateSession,
+    collaboration,
+    apiKeyStorage,
+    onDataBlockEvent,
+    openApiKeyModal,
+    apiKeyModalState,
   ]);
 
   return (
     <EditorContext.Provider value={contextValue}>
-      {children}
+      <SidebarPortalRegistryProvider>
+        <SidebarProvider isReadMode={isReadOnly}>{children}</SidebarProvider>
+      </SidebarPortalRegistryProvider>
     </EditorContext.Provider>
   );
 };

@@ -17,7 +17,9 @@ import {
   getSelectionCharacterOffsets,
 } from './cursor';
 import {
+  buildFiatCurrencyFormat,
   datenum_local,
+  getEffectiveGeneralDp,
   is_date,
   MAX_GENERAL_AUTO_DP,
   refreshGeneralNumericDisplay,
@@ -60,7 +62,14 @@ import {
   showLinkCard,
 } from './hyperlink';
 import { cfSplitRange } from './conditionalFormat';
+import {
+  removeBorderInfoInSelections,
+  syncBorderInfoToYdoc,
+} from '../utils/border-config-utils';
 import { clearMeasureTextCache, getCellTextInfo } from './text';
+import { hasCellMeaningfulContent } from '../utils/cell-persist-utils';
+import { CellFormatRange, removeCellFormatRangesInRect, upsertCellFormatRange } from '../utils/range-format';
+import { assignActiveConfigToSheetFile } from './sheet';
 
 type ToolbarItemClickHandler = (
   ctx: Context,
@@ -70,23 +79,151 @@ type ToolbarItemClickHandler = (
 
 type ToolbarItemSelectedFunc = (cell: Cell | null | undefined) => boolean;
 
-function pushToolbarCellDataUpdate(
+/** Same numeric recognition as default right-align in `normalizedCellAttr`. */
+function isCellEligibleForDecimalAdjust(
+  cell: Cell | null | undefined,
+): boolean {
+  // Empty / unset cell is Automatic — allow so +/- can store ct.dp for later values.
+  if (cell == null) return true;
+  if (cell.ct?.fa === '@') return false;
+  if (cell.ct?.t === 'n') return true;
+  if (isGeneralFormatCell(cell) && isCellValueEmpty(cell)) return true;
+  return (
+    typeof cell.v === 'number' || isRealNum(cell.v) || isRealNum(cell.m)
+  );
+}
+
+function isCellValueEmpty(cell: Cell | null | undefined): boolean {
+  if (cell == null) return true;
+  if (cell.v != null && cell.v !== '') return false;
+  if (cell.m != null && String(cell.m) !== '') return false;
+  if (cell.f != null && String(cell.f) !== '') return false;
+  return true;
+}
+
+function forEachSelectedCell(
   ctx: Context,
-  r: number,
-  c: number,
+  flowdata: CellMatrix,
+  fn: (row: number, col: number, cell: Cell | null | undefined) => void,
+) {
+  ctx.luckysheet_select_save?.forEach((selection) => {
+    for (let row = selection.row[0]; row <= selection.row[1]; row += 1) {
+      for (
+        let col = selection.column[0];
+        col <= selection.column[1];
+        col += 1
+      ) {
+        fn(row, col, flowdata[row]?.[col]);
+      }
+    }
+  });
+}
+
+function ensureGeneralAutoCell(
+  flowdata: CellMatrix,
+  row: number,
+  col: number,
+): Cell | null {
+  if (!flowdata[row]) return null;
+  const existing = flowdata[row][col];
+  if (existing != null && !_.isPlainObject(existing)) return null;
+  if (existing == null) {
+    flowdata[row][col] = { ct: { fa: 'General', t: 'g' } };
+  } else {
+    if (!existing.ct) existing.ct = {};
+    if (existing.ct.fa == null || existing.ct.fa === 'General') {
+      existing.ct.fa = 'General';
+      existing.ct.t = 'g';
+    }
+  }
+  return flowdata[row][col] as Cell;
+}
+
+function adjustGeneralDecimal(cell: Cell, delta: -1 | 1): boolean {
+  if (!_.isPlainObject(cell)) return false;
+  const empty = isCellValueEmpty(cell);
+  const raw = cell.v ?? cell.m;
+  if (!empty && (raw == null || !isRealNum(raw))) return false;
+  if (!cell.ct) cell.ct = {};
+  cell.ct.fa = 'General';
+  cell.ct.t = 'g';
+  const currentDp = empty
+    ? cell.ct.dp != null && cell.ct.dp >= 0
+      ? Math.min(MAX_GENERAL_AUTO_DP, Math.floor(cell.ct.dp))
+      : 0
+    : getEffectiveGeneralDp(cell);
+  if (delta < 0) {
+    if (currentDp <= 0) return false;
+    cell.ct.dp = currentDp - 1;
+  } else {
+    cell.ct.dp = Math.min(MAX_GENERAL_AUTO_DP, currentDp + 1);
+  }
+  if (!empty) {
+    refreshGeneralNumericDisplay(cell);
+  }
+  return true;
+}
+
+function isGeneralFormatCell(cell: Cell | null | undefined): boolean {
+  if (cell == null) return true;
+  const fa = cell.ct?.fa;
+  if (fa === 'General' || fa == null) return true;
+  return cell.ct?.t === 'g';
+}
+
+/** One cache clear + one ydoc batch for all updated cells. */
+function pushToolbarCellDataUpdates(
+  ctx: Context,
+  updated: { row: number; col: number }[],
   d: CellMatrix,
 ) {
+  if (updated.length === 0) return;
   clearMeasureTextCache();
-  const cell = d[r]?.[c];
-  ctx.hooks?.updateCellYdoc?.([
-    {
+  ctx.hooks?.updateCellYdoc?.(
+    updated.map(({ row, col }) => ({
       sheetId: ctx.currentSheetId,
       path: ['celldata'],
-      value: { r, c, v: cell },
-      key: `${r}_${c}`,
+      value: { r: row, c: col, v: d[row]?.[col] },
+      key: `${row}_${col}`,
       type: 'update',
-    },
-  ]);
+    })),
+  );
+}
+
+function pushRangeFormatConfigUpdate(
+  changes: any[],
+  ctx: Context,
+  sheetIndex: number,
+  row_st: number,
+  row_ed: number,
+  col_st: number,
+  col_ed: number,
+  attrs: Partial<CellFormatRange>,
+) {
+  ctx.luckysheetfile[sheetIndex].config ||= {};
+  const cfg = ctx.luckysheetfile[sheetIndex].config!;
+  const { ranges, changed } = upsertCellFormatRange(
+    cfg.cellFormatRanges,
+    row_st,
+    row_ed,
+    col_st,
+    col_ed,
+    attrs,
+  );
+  if (!changed) return;
+  cfg.cellFormatRanges = ranges;
+  // Keep live ctx.config in sync so sheet-leave persist cannot wipe ranges.
+  const sheetId = ctx.luckysheetfile[sheetIndex]?.id;
+  if (sheetId === ctx.currentSheetId) {
+    ctx.config ||= {};
+    ctx.config.cellFormatRanges = ranges;
+  }
+  changes.push({
+    sheetId: ctx.currentSheetId,
+    path: ['config', 'cellFormatRanges'],
+    value: ranges,
+    type: 'update',
+  });
 }
 
 export function updateFormatCell(
@@ -105,6 +242,9 @@ export function updateFormatCell(
   }
   if (attr === 'ct') {
     const changes: any = [];
+    let hasEmptyCellFormat = false;
+    let emptyRangeAttrs: Partial<CellFormatRange> | null = null;
+
     for (let r = row_st; r <= row_ed; r += 1) {
       if (!_.isNil(ctx.config.rowhidden) && !_.isNil(ctx.config.rowhidden[r])) {
         continue;
@@ -112,21 +252,8 @@ export function updateFormatCell(
 
       for (let c = col_st; c <= col_ed; c += 1) {
         const cell = d[r][c];
-        let value;
 
-        if (_.isPlainObject(cell)) {
-          // When switching a date cell to plain text, preserve user-visible date text
-          // instead of converting Excel serial (`v`) into the new format.
-          if (cell?.ct?.t === 'd') {
-            value = cell?.m ?? cell?.v ?? cell?.ct?.s?.[0]?.v;
-          } else {
-            value = cell?.v ?? cell?.ct?.s?.[0]?.v;
-          }
-        } else {
-          value = cell;
-        }
-
-        // Compute type early (depends only on foucsStatus, not cell value) so it's available for empty cells too
+        // Compute target type before resolving value (depends only on foucsStatus).
         let type = 'n';
 
         if (
@@ -149,6 +276,31 @@ export function updateFormatCell(
           type = 's';
         }
 
+        let value;
+
+        if (_.isPlainObject(cell)) {
+          const rawV = cell?.v;
+          const rawM = cell?.m ?? cell?.ct?.s?.[0]?.v;
+
+          if (foucsStatus === '@' && cell?.ct?.t === 'd') {
+            // Plain text: preserve user-visible date/time text.
+            value = rawM ?? rawV ?? cell?.ct?.s?.[0]?.v;
+          } else if (
+            cell?.ct?.t === 'd' &&
+            isRealNum(rawV) &&
+            type !== 's'
+          ) {
+            // Date/time cells keep Excel serial in `v` — reuse it when reformatting.
+            value = rawV;
+          } else if (cell?.ct?.t === 'd') {
+            value = rawM ?? rawV ?? cell?.ct?.s?.[0]?.v;
+          } else {
+            value = rawV ?? cell?.ct?.s?.[0]?.v;
+          }
+        } else {
+          value = cell;
+        }
+
         if (_.isNil(value)) {
           // Store format on empty cells so future data entries inherit it; previously these were skipped entirely
           if (!_.isNil(d[r])) {
@@ -167,6 +319,11 @@ export function updateFormatCell(
               if (type === 'n') d[r][c]!.ht = 2;
             }
           }
+          hasEmptyCellFormat = true;
+          emptyRangeAttrs = {
+            ct: { fa: foucsStatus, t: type },
+            ...(type === 'n' ? { ht: 2 } : {}),
+          };
           continue;
         }
 
@@ -232,9 +389,24 @@ export function updateFormatCell(
           type: 'update',
         });
       }
-      if (ctx?.hooks?.updateCellYdoc) {
-        ctx.hooks?.updateCellYdoc(changes);
-      }
+    }
+
+    const sheetIndex = getSheetIndex(ctx, ctx.currentSheetId);
+    if (hasEmptyCellFormat && emptyRangeAttrs && sheetIndex != null) {
+      pushRangeFormatConfigUpdate(
+        changes,
+        ctx,
+        sheetIndex,
+        row_st,
+        row_ed,
+        col_st,
+        col_ed,
+        emptyRangeAttrs,
+      );
+    }
+
+    if (ctx?.hooks?.updateCellYdoc && changes.length > 0) {
+      ctx.hooks?.updateCellYdoc(changes);
     }
   } else {
     if (attr === 'ht') {
@@ -282,6 +454,7 @@ export function updateFormatCell(
       return;
     }
     const changes: any = [];
+    let hasEmptyCellFormat = false;
     for (let r = row_st; r <= row_ed; r += 1) {
       if (!_.isNil(ctx.config.rowhidden) && !_.isNil(ctx.config.rowhidden[r])) {
         continue;
@@ -324,25 +497,56 @@ export function updateFormatCell(
               _.set(cfg, `rowlen.${r}`, rowHeight);
             }
           }
+
+          if (hasCellMeaningfulContent(value)) {
+            changes.push({
+              sheetId: ctx.currentSheetId,
+              path: ['celldata'],
+              value: {
+                r,
+                c,
+                v: d[r][c],
+              },
+              key: `${r}_${c}`,
+              type: 'update',
+            });
+          } else {
+            hasEmptyCellFormat = true;
+          }
+        } else if (value != null && typeof value !== 'object') {
+          d[r][c] = { v: value, [attr]: foucsStatus } as Cell;
+          changes.push({
+            sheetId: ctx.currentSheetId,
+            path: ['celldata'],
+            value: {
+              r,
+              c,
+              v: d[r][c],
+            },
+            key: `${r}_${c}`,
+            type: 'update',
+          });
         } else {
           // @ts-ignore
           d[r][c] = { v: value };
           // @ts-ignore
           d[r][c][attr] = foucsStatus;
+          hasEmptyCellFormat = true;
         }
-
-        changes.push({
-          sheetId: ctx.currentSheetId,
-          path: ['celldata'],
-          value: {
-            r,
-            c,
-            v: d[r][c],
-          },
-          key: `${r}_${c}`,
-          type: 'update',
-        });
       }
+    }
+
+    if (hasEmptyCellFormat) {
+      pushRangeFormatConfigUpdate(
+        changes,
+        ctx,
+        sheetIndex,
+        row_st,
+        row_ed,
+        col_st,
+        col_ed,
+        { [attr]: foucsStatus } as Partial<CellFormatRange>,
+      );
     }
 
     if (attr === 'tb' && canvas) {
@@ -366,7 +570,7 @@ export function updateFormatCell(
       }
     }
 
-    if (ctx?.hooks?.updateCellYdoc) {
+    if (ctx?.hooks?.updateCellYdoc && changes.length > 0) {
       ctx.hooks?.updateCellYdoc(changes);
     }
   }
@@ -1137,7 +1341,13 @@ export function handleCurrencyFormat(ctx: Context, cellInput: HTMLDivElement) {
 
   const currency = ctx.currency || '¥';
 
-  updateFormat(ctx, cellInput, flowdata, 'ct', `${currency} #,##0.00`);
+  updateFormat(
+    ctx,
+    cellInput,
+    flowdata,
+    'ct',
+    buildFiatCurrencyFormat(currency, 2),
+  );
 }
 
 export function handlePercentageFormat(
@@ -1160,32 +1370,40 @@ export function handleNumberDecrease(ctx: Context, cellInput: HTMLDivElement) {
 
   let foucsStatus = normalizedAttr(flowdata, row_index, col_index, 'ct');
   const cell = flowdata[row_index][col_index];
-  const numericSample = cell?.v ?? cell?.m;
-  if (foucsStatus == null && cell != null && isRealNum(numericSample)) {
-    foucsStatus = { fa: 'General', t: 'g' };
-  }
 
-  if (
-    foucsStatus == null ||
-    (foucsStatus.t !== 'n' &&
-      !(foucsStatus.t === 'g' && isRealNum(numericSample)))
-  ) {
+  if (!isCellEligibleForDecimalAdjust(cell)) {
     return;
   }
 
-  // General (Auto): adjust display decimals via ct.dp only — keep fa General + t "g" (Sheets-like).
-  if (foucsStatus.fa === 'General') {
-    if (!cell || !_.isPlainObject(cell)) return;
-    const raw = cell.v ?? cell.m;
-    if (raw == null || !isRealNum(raw)) return;
-    if (!cell.ct?.dp || cell.ct.dp < 1) return;
-    if (cell.ct.dp <= 1) {
-      delete cell.ct.dp;
-    } else {
-      cell.ct.dp -= 1;
-    }
-    refreshGeneralNumericDisplay(cell);
-    pushToolbarCellDataUpdate(ctx, row_index, col_index, flowdata);
+  if (foucsStatus == null) {
+    foucsStatus = { fa: 'General', t: 'g' };
+  }
+
+  // General (Auto): adjust display decimals via ct.dp — keep fa General + t "g" (Sheets-like).
+  // Empty Auto cells also get ct.dp (same idea as empty Number cells keeping fa).
+  if (isGeneralFormatCell(cell)) {
+    const updated: { row: number; col: number }[] = [];
+    forEachSelectedCell(ctx, flowdata, (r, c, targetCell) => {
+      if (targetCell?.ct?.fa === '@') return;
+      if (targetCell != null && !isGeneralFormatCell(targetCell)) return;
+      if (
+        targetCell != null &&
+        !isCellEligibleForDecimalAdjust(targetCell) &&
+        !isCellValueEmpty(targetCell)
+      ) {
+        return;
+      }
+      const ensured = ensureGeneralAutoCell(flowdata, r, c);
+      if (!ensured) return;
+      if (adjustGeneralDecimal(ensured, -1)) {
+        updated.push({ row: r, col: c });
+      }
+    });
+    pushToolbarCellDataUpdates(ctx, updated, flowdata);
+    return;
+  }
+
+  if (foucsStatus.t !== 'n') {
     return;
   }
 
@@ -1266,31 +1484,40 @@ export function handleNumberIncrease(ctx: Context, cellInput: HTMLDivElement) {
   if (row_index === undefined || col_index === undefined) return;
   let foucsStatus = normalizedAttr(flowdata, row_index, col_index, 'ct');
   const cell = flowdata[row_index][col_index];
-  const numericSample = cell?.v ?? cell?.m;
-  if (foucsStatus == null && cell != null && isRealNum(numericSample)) {
-    foucsStatus = { fa: 'General', t: 'g' };
-  }
 
-  if (
-    foucsStatus == null ||
-    (foucsStatus.t !== 'n' &&
-      !(foucsStatus.t === 'g' && isRealNum(numericSample)))
-  ) {
+  if (!isCellEligibleForDecimalAdjust(cell)) {
     return;
   }
 
+  if (foucsStatus == null) {
+    foucsStatus = { fa: 'General', t: 'g' };
+  }
+
   // General (Auto): store decimal hint on ct.dp; keep fa/t as Auto (Sheets-like).
-  if (foucsStatus.fa === 'General') {
-    if (!cell || !_.isPlainObject(cell)) return;
-    const raw = cell.v ?? cell.m;
-    if (raw == null || !isRealNum(raw)) return;
-    if (!cell.ct) cell.ct = {};
-    const nextDp = Math.min(MAX_GENERAL_AUTO_DP, (cell.ct.dp ?? 0) + 1);
-    cell.ct.fa = 'General';
-    cell.ct.t = 'g';
-    cell.ct.dp = nextDp;
-    refreshGeneralNumericDisplay(cell);
-    pushToolbarCellDataUpdate(ctx, row_index, col_index, flowdata);
+  // Empty Auto cells also get ct.dp (same idea as empty Number cells keeping fa).
+  if (isGeneralFormatCell(cell)) {
+    const updated: { row: number; col: number }[] = [];
+    forEachSelectedCell(ctx, flowdata, (r, c, targetCell) => {
+      if (targetCell?.ct?.fa === '@') return;
+      if (targetCell != null && !isGeneralFormatCell(targetCell)) return;
+      if (
+        targetCell != null &&
+        !isCellEligibleForDecimalAdjust(targetCell) &&
+        !isCellValueEmpty(targetCell)
+      ) {
+        return;
+      }
+      const ensured = ensureGeneralAutoCell(flowdata, r, c);
+      if (!ensured) return;
+      if (adjustGeneralDecimal(ensured, 1)) {
+        updated.push({ row: r, col: c });
+      }
+    });
+    pushToolbarCellDataUpdates(ctx, updated, flowdata);
+    return;
+  }
+
+  if (foucsStatus.t !== 'n') {
     return;
   }
 
@@ -1534,79 +1761,56 @@ export function handleClearFormat(ctx: Context) {
         });
       }
     }
-    // 清空表格样式时，清除边框样式
-    const index = getSheetIndex(ctx, ctx.currentSheetId);
-    if (index == null) return false;
-    // 表格边框为空时，不对表格进行操作
-    if (ctx.config.borderInfo == null) return false;
-    const cfg = ctx.config || {};
-    if (cfg.borderInfo && cfg.borderInfo.length > 0) {
-      const source_borderInfo = [];
-
-      for (let i = 0; i < cfg.borderInfo.length; i += 1) {
-        const bd_rangeType = cfg.borderInfo[i].rangeType;
-
-        if (
-          bd_rangeType === 'range' &&
-          cfg.borderInfo[i].borderType !== 'border-slash'
-        ) {
-          const bd_range = cfg.borderInfo[i].range;
-          let bd_emptyRange: any = [];
-
-          for (let j = 0; j < bd_range.length; j += 1) {
-            bd_emptyRange = bd_emptyRange.concat(
-              cfSplitRange(
-                bd_range[j],
-                { row: [rowSt, rowEd], column: [colSt, colEd] },
-                { row: [rowSt, rowEd], column: [colSt, colEd] },
-                'restPart',
-              ),
-            );
-          }
-
-          cfg.borderInfo[i].range = bd_emptyRange;
-
-          source_borderInfo.push(cfg.borderInfo[i]);
-        } else if (bd_rangeType === 'cell') {
-          const bd_r = cfg.borderInfo[i].value.row_index;
-          const bd_c = cfg.borderInfo[i].value.col_index;
-
-          if (
-            !(bd_r >= rowSt && bd_r <= rowEd && bd_c >= colSt && bd_c <= colEd)
-          ) {
-            source_borderInfo.push(cfg.borderInfo[i]);
-          }
-        } else if (
-          bd_rangeType === 'range' &&
-          cfg.borderInfo[i].borderType === 'border-slash' &&
-          !(
-            cfg.borderInfo[i].range[0].row[0] >= rowSt &&
-            cfg.borderInfo[i].range[0].row[0] <= rowEd &&
-            cfg.borderInfo[i].range[0].column[0] >= colSt &&
-            cfg.borderInfo[i].range[0].column[0] <= colEd
-          )
-        ) {
-          source_borderInfo.push(cfg.borderInfo[i]);
-        }
-      }
-
-      ctx.luckysheetfile[index].config!.borderInfo = source_borderInfo;
-      borderInfoChanged = true;
-    }
     return true;
   });
 
+  const index = getSheetIndex(ctx, ctx.currentSheetId);
+  if (index != null && ctx.config.borderInfo?.length) {
+    const selections =
+      ctx.luckysheet_select_save?.map((s) => ({
+        row: s.row as [number, number],
+        column: s.column as [number, number],
+      })) ?? [];
+    const filtered = removeBorderInfoInSelections(
+      ctx.config.borderInfo,
+      selections,
+    );
+    ctx.luckysheetfile[index].config!.borderInfo = filtered;
+    ctx.config.borderInfo = filtered;
+    borderInfoChanged = true;
+  }
+
+  // Range-backed formatting survives strip-of-inline-attrs; punch selections out
+  // of cellFormatRanges (O(ranges), not O(area × ranges)).
+  let formatRangesChanged = false;
+  if (index != null && ctx.luckysheet_select_save?.length) {
+    const sheet = ctx.luckysheetfile[index];
+    sheet.config ||= {};
+    let nextRanges = sheet.config.cellFormatRanges ?? ctx.config?.cellFormatRanges;
+    const prevRanges = nextRanges;
+    ctx.luckysheet_select_save.forEach((selection) => {
+      nextRanges = removeCellFormatRangesInRect(
+        nextRanges,
+        selection.row as [number, number],
+        selection.column as [number, number],
+      );
+    });
+    if (!_.isEqual(prevRanges, nextRanges)) {
+      sheet.config.cellFormatRanges = nextRanges;
+      ctx.config.cellFormatRanges = nextRanges;
+      formatRangesChanged = true;
+    }
+  }
+
   if (ctx?.hooks?.updateCellYdoc) {
     if (borderInfoChanged) {
-      const index = getSheetIndex(ctx, ctx.currentSheetId);
-      const borderInfo =
-        index == null
-          ? (ctx.config?.borderInfo ?? [])
-          : (ctx.luckysheetfile[index]?.config?.borderInfo ?? []);
+      syncBorderInfoToYdoc(ctx, ctx.config?.borderInfo ?? []);
+    }
+    if (formatRangesChanged) {
       ydocChanges.push({
         sheetId: ctx.currentSheetId,
-        path: ['config', 'borderInfo'],
-        value: borderInfo,
+        path: ['config', 'cellFormatRanges'],
+        value: ctx.config.cellFormatRanges ?? [],
         type: 'update',
       });
     }
@@ -1677,6 +1881,24 @@ export function handleBorder(
     cfg.borderInfo = [];
   }
 
+  const selections =
+    ctx.luckysheet_select_save?.map((s) => ({
+      row: s.row as [number, number],
+      column: s.column as [number, number],
+    })) ?? [];
+
+  // Only strip overlapping entries for the eraser. Other border types must
+  // accumulate (border-all then border-top = both), matching pre-strip semantics.
+  if (type === 'border-none') {
+    cfg.borderInfo = removeBorderInfoInSelections(cfg.borderInfo, selections);
+    const index = getSheetIndex(ctx, ctx.currentSheetId);
+    if (index == null) return;
+    assignActiveConfigToSheetFile(ctx.luckysheetfile[index], ctx.config);
+    ctx.config = ctx.luckysheetfile[index].config!;
+    syncBorderInfoToYdoc(ctx, cfg.borderInfo);
+    return;
+  }
+
   if (type !== 'border-slash') {
     const borderInfo = {
       rangeType: 'range',
@@ -1714,11 +1936,9 @@ export function handleBorder(
   const index = getSheetIndex(ctx, ctx.currentSheetId);
   if (index == null) return;
 
-  ctx.luckysheetfile[index].config = ctx.config;
-
-  // setTimeout(function () {
-  //   luckysheetrefreshgrid();
-  // }, 1);
+  assignActiveConfigToSheetFile(ctx.luckysheetfile[index], ctx.config);
+  ctx.config = ctx.luckysheetfile[index].config!;
+  syncBorderInfoToYdoc(ctx, cfg.borderInfo);
 }
 
 export function handleMerge(ctx: Context, type: string) {

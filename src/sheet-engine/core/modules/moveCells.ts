@@ -20,6 +20,11 @@ import { GlobalCache, HyperlinkEntry } from '../types';
 import { jfrefreshgrid } from './refresh';
 import { CFSplitRange } from './ConditionFormat';
 import { functionMoveReference } from './formula';
+import { moveCellFormatRanges, rangesEqual } from '../utils/range-format';
+import {
+  getSheetCommentKeyPrefixes,
+  notifyCommentAnchorMove,
+} from '../utils/comment-anchor-move';
 
 const dragCellThreshold = 8;
 
@@ -658,6 +663,26 @@ export function onCellsMoveEnd(
   range.push({ row: last.row, column: last.column });
   range.push({ row: [row_s, row_e], column: [col_s, col_e] });
 
+  const previousFormatRanges =
+    file.config?.cellFormatRanges ?? cfg.cellFormatRanges;
+  const nextFormatRanges = moveCellFormatRanges(
+    previousFormatRanges,
+    {
+      row: [last.row[0], last.row[1]],
+      column: [last.column[0], last.column[1]],
+    },
+    { row: [row_s, row_e], column: [col_s, col_e] },
+  );
+  if (!rangesEqual(previousFormatRanges, nextFormatRanges)) {
+    cfg.cellFormatRanges = nextFormatRanges;
+    cellChanges.push({
+      sheetId: ctx.currentSheetId,
+      path: ['config', 'cellFormatRanges'],
+      value: nextFormatRanges,
+      type: 'update',
+    });
+  }
+
   last.row = [row_s, row_e];
   last.column = [col_s, col_e];
   last.row_focus = rf;
@@ -743,6 +768,20 @@ export function onCellsMoveEnd(
   // };
 
   jfrefreshgrid(ctx, d, range);
+
+  notifyCommentAnchorMove(ctx, {
+    type: 'cells',
+    sheetId: String(file?.id ?? ctx.currentSheetId),
+    sheetKeys: getSheetCommentKeyPrefixes(file, index),
+    source: {
+      row: [range[0].row[0], range[0].row[1]],
+      column: [range[0].column[0], range[0].column[1]],
+    },
+    target: {
+      row: [range[1].row[0], range[1].row[1]],
+      column: [range[1].column[0], range[1].column[1]],
+    },
+  });
 
   // selectHightlightShow();
 

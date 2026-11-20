@@ -1,7 +1,7 @@
 // @ts-ignore
 import { Parser, ERROR_REF } from '@sheet-engine/formula-parser';
 import _ from 'lodash';
-import type { Cell, Rect, Selection } from '../types';
+import type { Cell, CellMatrix, Rect, Selection } from '../types';
 import { Context, getFlowdata } from '../context';
 import {
   columnCharToIndex,
@@ -21,7 +21,16 @@ import {
 } from './cell';
 import { error, detectErrorFromValue, isNumericCellType } from './validation';
 import { locale } from '../locale';
-import { colors } from './color';
+import {
+  FormulaArrowMode,
+  FormulaArrowOverride,
+  getCaretContext,
+  isReferenceDirtyingKeyCode,
+  isTextChangingKeyCode,
+  resolveArrowMode,
+  tokenizeFormula,
+} from './formula-arrow-mode';
+import { getRangeColor } from './color';
 import { colLocation, mousePosition, rowLocation } from './location';
 import {
   cancelFunctionrangeSelected,
@@ -30,8 +39,29 @@ import {
   setCellError,
   spillSortResult,
 } from '.';
+import {
+  FORMULA_ASYNC_CHUNK_SIZE,
+  FORMULA_ASYNC_EVAL_THRESHOLD,
+  type FormulaAsyncEvalJob,
+} from './formula-async-eval';
+import { ensureSheetFlowdata } from '../api/sheet';
+import { invalidateSheetsRequiredDenseCache } from '../api/sheet-flowdata-lifecycle';
+import { changeSheet } from './sheet';
+import { shouldPersistCelldataCell } from '../utils/cell-persist-utils';
+import {
+  beginRangeValuePassCache,
+  clearRangeValuePassCache,
+  collectGlobalDataKeysInRange,
+  makeRangePassCacheKey,
+  sliceRangeFragmentForOrigin,
+  type RangePassCacheEntry,
+} from './formula-range-cache';
+import { collectTransitiveFormulaDependents } from './formula-transitive-deps';
+import type { SnapshotEvalOutput } from './formula-snapshot-eval';
+import { resolveDefinedNameForFormula } from './namedRanges';
 
 let functionHTMLIndex = 0;
+let formulaAsyncEvalJobId = 0;
 let rangeIndexes: number[] = [];
 const operatorPriority: any = {
   '^': 0,
@@ -49,6 +79,15 @@ for (let i = 0; i < operatorArr.length; i += 1) {
 const ZWSP = '\u200b';
 const normalizeFormulaBoundaryText = (s: string) =>
   (s || '').replace(/\u00a0/g, ' ').replace(/\u200b/g, '');
+
+/** Significant char immediately left of caret (trailing spaces ignored). */
+function getSignificantCharBeforeCaret(
+  fullText: string,
+  caretOffset: number,
+): string {
+  return fullText.slice(0, caretOffset).trimEnd().slice(-1);
+}
+
 function formulaDebugPreview(value: any) {
   if (Array.isArray(value)) {
     return {
@@ -77,7 +116,7 @@ function formulaDebugStable(value: any) {
   }
   return preview;
 }
-const simpleSheetName = '[A-Za-z0-9_\u00C0-\u02AF]+';
+const simpleSheetName = "[^'!:]+";
 const quotedSheetName = "'(?:(?!').|'')*'";
 const sheetNameRegexp = `(${simpleSheetName}|${quotedSheetName})!`;
 // Used for sheet-qualified refs like `'Sheet 1'!A1`, `'Sheet'!A:A`, `'Sheet'!1:1`.
@@ -235,6 +274,26 @@ function parseCellKey(
   return { sheetId, r, c };
 }
 
+/** In-pass formula value cache; must be a plain object while a recalc pass runs. */
+function ensureExecFunctionGlobalData(ctx: Context) {
+  if (ctx.formulaCache.execFunctionGlobalData == null) {
+    ctx.formulaCache.execFunctionGlobalData = {};
+  }
+}
+
+function writeExecFunctionGlobalDataCell(
+  ctx: Context,
+  r: number,
+  c: number,
+  sheetId: string,
+  value: { v: unknown; f: unknown },
+) {
+  if (ctx.formulaCache.execFunctionGlobalData == null) {
+    ensureExecFunctionGlobalData(ctx);
+  }
+  ctx.formulaCache.execFunctionGlobalData[`${r}_${c}_${sheetId}`] = value;
+}
+
 // FormulaCache is defined as class to avoid being frozen by immer
 export class FormulaCache {
   parser: any;
@@ -286,12 +345,33 @@ export class FormulaCache {
   // range navigation until the formula text is manually edited.
   keyboardRangeSelectionLock?: boolean;
 
+  // Sticky F2 choice for the current edit session (see formula-arrow-mode.ts).
+  // null/undefined = automatic. Cleared when the edit session ends.
+  arrowOverride?: FormulaArrowOverride;
+
+  // false when the session opened on an existing formula (F2 / double-click /
+  // formula bar): arrows move the caret until the user presses F2.
+  // undefined = true.
+  arrowAutoAllowed?: boolean;
+
+  // Cell [row, col] that `arrowOverride` / `arrowAutoAllowed` belong to. A
+  // session that ended through a path that never reset them (several exits just
+  // clear `luckysheetCellUpdate`) is detected by this not matching the cell now
+  // being edited, and its stale values are ignored.
+  arrowSessionCell?: [number, number];
+
   /** True after arrow/Shift+arrow moved `func_selectedrange` without updating yellow selection. */
   formulaKeyboardRefSync?: boolean;
 
   // Persistent owner of the current formula edit session. Unlike
   // document.activeElement, this survives canvas clicks during range picking.
   formulaEditorOwner?: 'cell' | 'fx' | null;
+
+  /**
+   * Set when switching sheets while a formula edit stays open so InputBox/Fx
+   * can restore focus/caret for continued keyboard ref picking.
+   */
+  refocusFormulaEditorAfterSheetSwitch?: boolean;
 
   functionRangeIndex?: number[];
 
@@ -312,10 +392,26 @@ export class FormulaCache {
   revDepsByCell: Map<string, Set<string>>;
 
   /**
+   * Formulas that referenced a range too large to fully expand into `revDepsByCell`.
+   * These must be included on incremental recalcs because a single-cell edit may
+   * affect them even when no precise reverse edge exists.
+   */
+  formulasWithWideRangeDeps: Set<string>;
+
+  /**
    * Dependency collection state for the currently-parsed formula, set by `execfunction`.
    * When null, dependency recording is disabled.
    */
-  activeDepCollection: null | { originKey: string; deps: Set<string> };
+  activeDepCollection: null | {
+    originKey: string;
+    deps: Set<string>;
+    hasWideRangeDep: boolean;
+  };
+
+  /** Step 2: per execFunctionGroup pass cache for materialized range reads. */
+  rangeValuePassCache?: Map<string, RangePassCacheEntry>;
+
+  rangeValuePassCacheStats?: { hits: number; misses: number };
 
   constructor() {
     const that = this;
@@ -335,6 +431,7 @@ export class FormulaCache {
     this.cellTextToIndexList = {};
     this.depsByCell = new Map();
     this.revDepsByCell = new Map();
+    this.formulasWithWideRangeDeps = new Set();
     this.activeDepCollection = null;
     this.parser = new Parser();
     this.parser.on(
@@ -347,11 +444,13 @@ export class FormulaCache {
             : getSheetIdByName(context, cellCoord.sheetName);
         if (id == null) throw Error(ERROR_REF);
         recordDep(toCellKey(id, cellCoord.row.index, cellCoord.column.index));
-        const flowdata = getFlowdata(context, id);
+        // Inactive tabs may be demoted to sparse celldata; hydrate on demand.
+        // Cheap no-op when already dense (`sheet.data?.length`).
+        const flowdata = ensureSheetFlowdata(context, { id });
+        const cacheKey = `${cellCoord.row.index}_${cellCoord.column.index}_${id}`;
         const cell =
-          context?.formulaCache.execFunctionGlobalData?.[
-            `${cellCoord.row.index}_${cellCoord.column.index}_${id}`
-          ] || flowdata?.[cellCoord.row.index]?.[cellCoord.column.index];
+          context?.formulaCache.execFunctionGlobalData?.[cacheKey] ||
+          flowdata?.[cellCoord.row.index]?.[cellCoord.column.index];
         const v = that.tryGetCellAsNumber(cell);
         done(v);
       },
@@ -366,8 +465,8 @@ export class FormulaCache {
             ? options.sheetId
             : getSheetIdByName(context, startCellCoord.sheetName);
         if (id == null) throw Error(ERROR_REF);
-        const flowdata = getFlowdata(context, id);
-        const fragment = [];
+        // Same as callCellValue: demoted cross-sheet targets must rehydrate.
+        const flowdata = ensureSheetFlowdata(context, { id });
         let startRow = startCellCoord.row.index;
         let endRow = endCellCoord.row.index;
         let startCol = startCellCoord.column.index;
@@ -383,10 +482,8 @@ export class FormulaCache {
           endCol = flowdata?.[0].length ?? 0;
         }
         if (emptyRow && emptyCol) throw Error(ERROR_REF);
-        let cryptoDenomination = '';
-        let cryptoDecimal = 0;
 
-        // Record dependencies for cycle detection. Unlike value aggregation below (which skips origin),
+        // Record dependencies for cycle detection.
         // dependency recording must include the origin cell when it lies within the referenced range.
         if (that.activeDepCollection) {
           const originRow = typeof options === 'object' ? options.row : null;
@@ -410,52 +507,105 @@ export class FormulaCache {
                 recordDep(toCellKey(id, row, col));
               }
             }
-          } else if (originInRange) {
-            // Still record self-in-range to detect circular refs.
-            recordDep(toCellKey(id, originRow, originCol));
+          } else {
+            that.activeDepCollection.hasWideRangeDep = true;
+            if (originInRange) {
+              // Still record self-in-range to detect circular refs.
+              recordDep(toCellKey(id, originRow, originCol));
+            }
           }
         }
 
-        for (let row = startRow; row <= endRow; row += 1) {
-          const colFragment = [];
+        const originRow = typeof options === 'object' ? options.row : null;
+        const originCol = typeof options === 'object' ? options.column : null;
+        const skippedOrigin =
+          originRow != null &&
+          originCol != null &&
+          originRow >= startRow &&
+          originRow <= endRow &&
+          originCol >= startCol &&
+          originCol <= endCol;
 
-          for (let col = startCol; col <= endCol; col += 1) {
-            if (
-              typeof options === 'object' &&
-              row === options.row &&
-              col === options.column
-            ) {
-              continue;
-            }
-            const cell =
-              context?.formulaCache.execFunctionGlobalData?.[
-                `${row}_${col}_${id}`
-              ] || flowdata?.[row]?.[col];
-            const v = that.tryGetCellAsNumber(cell);
-            // FLV crypto denomination --START--
-            if (
-              (cell?.m?.includes('ETH') ||
-                cell?.m?.includes('SOL') ||
-                cell?.m?.includes('BTC')) &&
-              cryptoDenomination !== 'Error'
-            ) {
-              const visualString = cell?.m.split(' ');
-              if (
-                cryptoDenomination !== '' &&
-                cryptoDenomination !== visualString[1]
-              ) {
-                cryptoDenomination = 'Error';
-              } else {
-                cryptoDenomination = visualString[1];
-              }
-              cryptoDecimal = visualString[0].includes('.')
-                ? visualString[0].split('.')[1]?.length
-                : 0;
-            }
-            colFragment.push(v);
+        let fragment: any[][] | null = null;
+        let cryptoDenomination = '';
+        let cryptoDecimal = 0;
+
+        if (that.rangeValuePassCache) {
+          const cacheKey = makeRangePassCacheKey(
+            id,
+            startRow,
+            endRow,
+            startCol,
+            endCol,
+          );
+          const fingerprint = collectGlobalDataKeysInRange(
+            context.formulaCache.execFunctionGlobalData ?? {},
+            id,
+            startRow,
+            endRow,
+            startCol,
+            endCol,
+          );
+          const cached = that.rangeValuePassCache.get(cacheKey);
+          if (cached && cached.globalDataKeysFingerprint === fingerprint) {
+            that.rangeValuePassCacheStats!.hits += 1;
+            fragment = sliceRangeFragmentForOrigin(
+              cached.fragment,
+              startRow,
+              startCol,
+              skippedOrigin ? originRow : null,
+              skippedOrigin ? originCol : null,
+            );
+            cryptoDenomination = cached.cryptoDenomination;
+            cryptoDecimal = cached.cryptoDecimal;
+          } else {
+            that.rangeValuePassCacheStats!.misses += 1;
+            const built = that.materializeFullRangeFragment(
+              context,
+              id,
+              flowdata,
+              startRow,
+              endRow,
+              startCol,
+              endCol,
+            );
+            that.rangeValuePassCache.set(cacheKey, {
+              fragment: built.fragment,
+              cryptoDenomination: built.cryptoDenomination,
+              cryptoDecimal: built.cryptoDecimal,
+              globalDataKeysFingerprint: fingerprint,
+            });
+            fragment = sliceRangeFragmentForOrigin(
+              built.fragment,
+              startRow,
+              startCol,
+              skippedOrigin ? originRow : null,
+              skippedOrigin ? originCol : null,
+            );
+            cryptoDenomination = built.cryptoDenomination;
+            cryptoDecimal = built.cryptoDecimal;
           }
-          fragment.push(colFragment);
+        } else {
+          const built = that.materializeFullRangeFragment(
+            context,
+            id,
+            flowdata,
+            startRow,
+            endRow,
+            startCol,
+            endCol,
+          );
+          fragment = sliceRangeFragmentForOrigin(
+            built.fragment,
+            startRow,
+            startCol,
+            skippedOrigin ? originRow : null,
+            skippedOrigin ? originCol : null,
+          );
+          cryptoDenomination = built.cryptoDenomination;
+          cryptoDecimal = built.cryptoDecimal;
         }
+
         if (cryptoDenomination === 'Error') {
           cryptoDenomination = '';
           cryptoDecimal = 0;
@@ -466,9 +616,167 @@ export class FormulaCache {
         }
       },
     );
+
+    // Named ranges: `=Custom` / `=SUM(Custom)` parse as VARIABLE → callVariable.
+    this.parser.on('callVariable', (name: string, done: (value: any) => void) => {
+      const context = that.parser.context as Context;
+      const options = that.parser.options || {};
+      const dn = resolveDefinedNameForFormula(
+        context?.definedNames,
+        name,
+        options.sheetId,
+      );
+      if (!dn) return;
+
+      const id = dn.sheetId;
+      const startRow = dn.range.row[0];
+      const endRow = dn.range.row[1];
+      const startCol = dn.range.column[0];
+      const endCol = dn.range.column[1];
+      // Named ranges can point at demoted sheets — hydrate before materialize.
+      const flowdata = ensureSheetFlowdata(context, { id });
+
+      if (that.activeDepCollection) {
+        const originRow = typeof options === 'object' ? options.row : null;
+        const originCol = typeof options === 'object' ? options.column : null;
+        const originInRange =
+          originRow != null &&
+          originCol != null &&
+          originRow >= startRow &&
+          originRow <= endRow &&
+          originCol >= startCol &&
+          originCol <= endCol;
+
+        const rowCount = endRow - startRow + 1;
+        const colCount = endCol - startCol + 1;
+        const MAX_RANGE_DEPS = 10_000;
+        const approxSize = rowCount * colCount;
+        if (approxSize <= MAX_RANGE_DEPS) {
+          for (let row = startRow; row <= endRow; row += 1) {
+            for (let col = startCol; col <= endCol; col += 1) {
+              recordDep(toCellKey(id, row, col));
+            }
+          }
+        } else {
+          that.activeDepCollection.hasWideRangeDep = true;
+          if (originInRange) {
+            recordDep(toCellKey(id, originRow, originCol));
+          }
+        }
+      }
+
+      const isSingle = startRow === endRow && startCol === endCol;
+      if (isSingle) {
+        const cacheKey = `${startRow}_${startCol}_${id}`;
+        const cell =
+          context?.formulaCache.execFunctionGlobalData?.[cacheKey] ||
+          flowdata?.[startRow]?.[startCol];
+        done(that.tryGetCellAsNumber(cell));
+        return;
+      }
+
+      const originRow = typeof options === 'object' ? options.row : null;
+      const originCol = typeof options === 'object' ? options.column : null;
+      const skippedOrigin =
+        originRow != null &&
+        originCol != null &&
+        originRow >= startRow &&
+        originRow <= endRow &&
+        originCol >= startCol &&
+        originCol <= endCol;
+
+      const built = that.materializeFullRangeFragment(
+        context,
+        id,
+        flowdata,
+        startRow,
+        endRow,
+        startCol,
+        endCol,
+      );
+      const fragment = sliceRangeFragmentForOrigin(
+        built.fragment,
+        startRow,
+        startCol,
+        skippedOrigin ? originRow : null,
+        skippedOrigin ? originCol : null,
+      );
+      if (
+        built.cryptoDenomination &&
+        built.cryptoDenomination !== 'Error'
+      ) {
+        that.parser.cryptoDenomination = built.cryptoDenomination;
+        that.parser.cryptoDecimals = built.cryptoDecimal;
+      }
+      done(fragment);
+    });
+  }
+
+  materializeFullRangeFragment(
+    context: Context,
+    sheetId: string,
+    flowdata: CellMatrix | null | undefined,
+    startRow: number,
+    endRow: number,
+    startCol: number,
+    endCol: number,
+  ): {
+    fragment: any[][];
+    cryptoDenomination: string;
+    cryptoDecimal: number;
+  } {
+    const fragment: any[][] = [];
+    let cryptoDenomination = '';
+    let cryptoDecimal = 0;
+
+    for (let row = startRow; row <= endRow; row += 1) {
+      const colFragment: any[] = [];
+      for (let col = startCol; col <= endCol; col += 1) {
+        const cell =
+          context?.formulaCache.execFunctionGlobalData?.[
+          `${row}_${col}_${sheetId}`
+          ] || flowdata?.[row]?.[col];
+        const v = this.tryGetCellAsNumber(cell);
+        if (
+          (cell?.m?.includes('ETH') ||
+            cell?.m?.includes('SOL') ||
+            cell?.m?.includes('BTC')) &&
+          cryptoDenomination !== 'Error'
+        ) {
+          const visualString = cell?.m.split(' ');
+          if (
+            cryptoDenomination !== '' &&
+            cryptoDenomination !== visualString[1]
+          ) {
+            cryptoDenomination = 'Error';
+          } else {
+            cryptoDenomination = visualString[1];
+          }
+          cryptoDecimal = visualString[0].includes('.')
+            ? visualString[0].split('.')[1]?.length
+            : 0;
+        }
+        colFragment.push(v);
+      }
+      fragment.push(colFragment);
+    }
+
+    if (cryptoDenomination === 'Error') {
+      cryptoDenomination = '';
+      cryptoDecimal = 0;
+    }
+
+    return { fragment, cryptoDenomination, cryptoDecimal };
   }
 
   tryGetCellAsNumber(cell: Cell) {
+    // Inline rich-text cells (e.g. hyperlinked text) keep their display text in
+    // `ct.s` segments; `v` is not reliably a plain string. Return the joined
+    // segment text so text predicates like ISTEXT see a real string.
+    if (cell?.ct?.t === 'inlineStr' && Array.isArray(cell.ct.s)) {
+      return (cell.ct.s as { v?: string }[]).map((s) => s?.v ?? '').join('');
+    }
+
     const rawV = cell?.v;
     const normalizedV =
       typeof rawV === 'string' ? rawV.trim().replace(/,/g, '') : rawV;
@@ -490,8 +798,8 @@ export class FormulaCache {
     const isCryptoDeno =
       typeof cell?.m === 'string'
         ? cell?.m?.includes('ETH') ||
-          cell?.m?.includes('SOL') ||
-          cell?.m?.includes('BTC')
+        cell?.m?.includes('SOL') ||
+        cell?.m?.includes('BTC')
         : false;
     if (isCryptoDeno && typeof cell?.m === 'string') {
       const splitedNumberString = cell.m.split(' ')[0];
@@ -637,11 +945,14 @@ export function getcellrange(ctx: Context, txt: string, formulaId?: string) {
     _.forEach(luckysheetfile, (f) => {
       if (sheettxt === f.name) {
         sheetId = f.id;
-        sheetdata = f.data;
+        sheetdata = f.data ?? null;
         return false;
       }
       return true;
     });
+    if (sheetId != null && _.isNil(sheetdata)) {
+      sheetdata = ensureSheetFlowdata(ctx, { id: sheetId });
+    }
   } else {
     let i = formulaId;
     if (_.isNil(i)) {
@@ -768,7 +1079,7 @@ function checkSpecialFunctionRange(
       ctx.calculateSheetId = id;
       const str = function_str
         .split(',')
-        [function_str.split(',').length - 1].split("'")[1]
+      [function_str.split(',').length - 1].split("'")[1]
         .split("'")[0];
 
       const str_nb = _.trim(str);
@@ -780,7 +1091,7 @@ function checkSpecialFunctionRange(
         // this.isFunctionRangeSaveChange(str, r, c, index, dynamicArray_compute);
         // console.log(function_str, str, this.isFunctionRangeSave,r,c);
       }
-    } catch {}
+    } catch { }
   }
 }
 
@@ -834,9 +1145,8 @@ function isFunctionRange(
           const funcArray = str.split(':');
           function_str += `luckysheet_getSpecialReference(true,'${_.trim(
             funcArray[0],
-          ).replace(/'/g, "\\'")}', luckysheet_function.${
-            funcArray[1]
-          }.f(#lucky#`;
+          ).replace(/'/g, "\\'")}', luckysheet_function.${funcArray[1]
+            }.f(#lucky#`;
         } else {
           function_str += `luckysheet_function.${str}.f(`;
         }
@@ -1187,6 +1497,7 @@ export function delFunctionGroup(
 
   // Remove dependency edges for this cell (it is no longer a formula).
   const originKey = `${id}:${r}:${c}`;
+  ctx.formulaCache.formulasWithWideRangeDeps.delete(originKey);
   const prevDeps = ctx.formulaCache?.depsByCell?.get(originKey);
   if (prevDeps) {
     prevDeps.forEach((depKey) => {
@@ -1196,6 +1507,7 @@ export function delFunctionGroup(
       if (rev.size === 0) ctx.formulaCache.revDepsByCell.delete(depKey);
     });
     ctx.formulaCache.depsByCell.delete(originKey);
+    invalidateSheetsRequiredDenseCache();
   }
 
   const file = ctx.luckysheetfile[getSheetIndex(ctx, id)!];
@@ -1218,6 +1530,7 @@ export function delFunctionGroup(
     }
     if (modified) {
       file.calcChain = calcChainClone;
+      invalidateSheetsRequiredDenseCache();
     }
   }
 
@@ -1349,6 +1662,8 @@ export function insertUpdateFunctionGroup(
   //   pos: file.calcChain.length - 1,
   // });
   ctx.luckysheetfile = luckysheetfile;
+  // New calcChain entry can add unevaluated cross-sheet refs that must stay dense.
+  invalidateSheetsRequiredDenseCache();
 }
 
 function replaceDotsInFunctionName(str: string) {
@@ -1371,6 +1686,9 @@ export function execfunction(
   notInsertFunc?: boolean,
 ) {
   const originalTxt = txt;
+  if (_.isNil(id)) {
+    id = ctx.currentSheetId;
+  }
   if (
     txt?.toUpperCase().includes('NETWORKDAYS.INTL') ||
     txt?.toUpperCase().includes('WORKDAY.INTL')
@@ -1383,10 +1701,6 @@ export function execfunction(
 
   if (!checkBracketNum(txt)) {
     txt += ')';
-  }
-
-  if (_.isNil(id)) {
-    id = ctx.currentSheetId;
   }
 
   ctx.calculateSheetId = id;
@@ -1515,11 +1829,17 @@ export function execfunction(
   const sheetId = id || ctx.currentSheetId;
   const originKey = `${sheetId}:${r}:${c}`;
   const deps = new Set<string>();
-  ctx.formulaCache.activeDepCollection = { originKey, deps };
+  ctx.formulaCache.formulasWithWideRangeDeps.delete(originKey);
+  ctx.formulaCache.activeDepCollection = {
+    originKey,
+    deps,
+    hasWideRangeDep: false,
+  };
 
   ctx.formulaCache.parser.context = ctx;
   const parserExpression = normalizeDateArithmeticForParser(txt.substring(1));
   let parsedResponse: { error: any; result: any };
+  let hasWideRangeDep = false;
   try {
     parsedResponse = ctx.formulaCache.parser.parse(parserExpression, {
       sheetId,
@@ -1527,7 +1847,12 @@ export function execfunction(
       column: c,
     });
   } finally {
+    hasWideRangeDep =
+      ctx.formulaCache.activeDepCollection?.hasWideRangeDep ?? false;
     ctx.formulaCache.activeDepCollection = null;
+  }
+  if (hasWideRangeDep) {
+    ctx.formulaCache.formulasWithWideRangeDeps.add(originKey);
   }
 
   // Update dependency graph for this formula cell.
@@ -1549,6 +1874,8 @@ export function execfunction(
     rev.add(originKey);
     ctx.formulaCache.revDepsByCell.set(depKey, rev);
   });
+  // Dense-sheet set depends on which tabs formulas reference.
+  invalidateSheetsRequiredDenseCache();
 
   // Non-iterative circular dependency semantics.
   const cycleNodes = findCycleNodesFrom(originKey, ctx.formulaCache.depsByCell);
@@ -1577,7 +1904,7 @@ export function execfunction(
       // re-propagate stale "#CIRC!" from prior states during structural recalcs.
       const cell =
         ctx?.formulaCache.execFunctionGlobalData?.[
-          `${parsedKey.r}_${parsedKey.c}_${parsedKey.sheetId}`
+        `${parsedKey.r}_${parsedKey.c}_${parsedKey.sheetId}`
         ];
       if (_.isNil(cell)) continue;
       const raw = cell?.v ?? cell?.m;
@@ -1720,6 +2047,17 @@ function insertUpdateDynamicArray(ctx: Context, dynamicArrayItem: any) {
 export function groupValuesRefresh(ctx: Context) {
   const { luckysheetfile } = ctx;
   if (ctx.groupValuesRefreshData.length > 0) {
+    const ydocChangeMap = new Map<
+      string,
+      {
+        sheetId: string;
+        path: string[];
+        key?: string;
+        value: any;
+        type?: 'update' | 'delete';
+      }
+    >();
+
     for (let i = 0; i < ctx.groupValuesRefreshData.length; i += 1) {
       const item = ctx.groupValuesRefreshData[i];
 
@@ -1731,7 +2069,10 @@ export function groupValuesRefresh(ctx: Context) {
       if (idx == null) continue;
 
       const file = luckysheetfile[idx];
-      const { data } = file;
+      let { data } = file;
+      if (_.isNil(data)) {
+        data = ensureSheetFlowdata(ctx, { id: item.id }) ?? undefined;
+      }
       if (_.isNil(data)) {
         continue;
       }
@@ -1747,20 +2088,25 @@ export function groupValuesRefresh(ctx: Context) {
       updateValue.v = item.v;
       updateValue.f = item.f;
       setCellValue(ctx, item.r, item.c, data, updateValue);
-      if (ctx?.hooks?.updateCellYdoc) {
-        ctx.hooks.updateCellYdoc([
-          {
-            sheetId: item.id,
-            path: ['celldata'],
-            value: {
-              r: item.r,
-              c: item.c,
-              v: data?.[item.r]?.[item.c] ?? null,
-            },
-            key: `${item.r}_${item.c}`,
-            type: 'update',
-          },
-        ]);
+
+      const cellValue = data?.[item.r]?.[item.c] ?? null;
+      const mapKey = `${item.r}_${item.c}`;
+      if (shouldPersistCelldataCell(cellValue)) {
+        ydocChangeMap.set(`${item.id}:${mapKey}`, {
+          sheetId: item.id,
+          path: ['celldata'],
+          value: { r: item.r, c: item.c, v: cellValue },
+          key: mapKey,
+          type: 'update',
+        });
+      } else {
+        ydocChangeMap.set(`${item.id}:${mapKey}`, {
+          sheetId: item.id,
+          path: ['celldata'],
+          key: mapKey,
+          value: null,
+          type: 'delete',
+        });
       }
       // server.saveParam("v", item.id, data[item.r][item.c], {
       //     "r": item.r,
@@ -1768,9 +2114,319 @@ export function groupValuesRefresh(ctx: Context) {
       // });
     }
 
+    const ydocChanges = Array.from(ydocChangeMap.values());
+    if (ydocChanges.length > 0 && ctx?.hooks?.updateCellYdoc) {
+      ctx.hooks.updateCellYdoc(ydocChanges);
+    }
+
     // editor.webWorkerFlowDataCache(Store.flowdata); // worker存数据
     ctx.groupValuesRefreshData = [];
   }
+}
+
+type FormulaRunListCell = {
+  r: number;
+  c: number;
+  id: string;
+  calc_funcStr: string;
+  level?: number;
+};
+
+function evalFormulaCellInGroup(
+  ctx: Context,
+  formulaCell: FormulaRunListCell,
+  calcChainSet: Set<string>,
+  data: CellMatrix | null | undefined,
+  impactedByCircular: Set<string>,
+  cycleNodes: Set<string>,
+) {
+  ensureExecFunctionGlobalData(ctx);
+  if ((formulaCell as { level?: unknown }).level === (Math as any).max) {
+    return;
+  }
+
+  const { calc_funcStr } = formulaCell;
+
+  const formulaCellKey = `${formulaCell.id}:${formulaCell.r}:${formulaCell.c}`;
+  if (impactedByCircular.has(formulaCellKey)) {
+    const isInCycle = cycleNodes.has(formulaCellKey);
+    const message = isInCycle
+      ? 'Circular dependency.'
+      : 'Circular dependency (upstream).';
+    setCellError(ctx, formulaCell.r, formulaCell.c, {
+      row_column: `${formulaCell.r}_${formulaCell.c}`,
+      title: CIRCULAR_REF_TITLE,
+      message,
+    });
+
+    ctx.groupValuesRefreshData.push({
+      r: formulaCell.r,
+      c: formulaCell.c,
+      v: CIRCULAR_REF_ERROR,
+      f: calc_funcStr,
+      id: formulaCell.id,
+    });
+
+    writeExecFunctionGlobalDataCell(
+      ctx,
+      formulaCell.r,
+      formulaCell.c,
+      formulaCell.id,
+      {
+        v: CIRCULAR_REF_ERROR,
+        f: calc_funcStr,
+      },
+    );
+
+    return;
+  }
+
+  const v = execfunction(
+    ctx,
+    calc_funcStr,
+    formulaCell.r,
+    formulaCell.c,
+    formulaCell.id,
+    calcChainSet,
+  );
+
+  const valueData = v?.[1];
+  const valueFunction = v?.[2];
+
+  if (Array.isArray(valueData)) {
+    const spilled = spillSortResult(
+      ctx,
+      formulaCell.r,
+      formulaCell.c,
+      { v: valueData, f: valueFunction },
+      data ?? undefined,
+    );
+
+    if (spilled) {
+      const matrixTopLeftValue = Array.isArray(valueData[0])
+        ? valueData[0][0]
+        : valueData[0];
+
+      ctx.groupValuesRefreshData.push({
+        r: formulaCell.r,
+        c: formulaCell.c,
+        v: matrixTopLeftValue,
+        f: valueFunction,
+        spe: v[3],
+        id: formulaCell.id,
+      });
+
+      writeExecFunctionGlobalDataCell(
+        ctx,
+        formulaCell.r,
+        formulaCell.c,
+        formulaCell.id,
+        { v: matrixTopLeftValue, f: valueFunction },
+      );
+
+      return;
+    }
+  }
+
+  ctx.groupValuesRefreshData.push({
+    r: formulaCell.r,
+    c: formulaCell.c,
+    v: v[1],
+    f: v[2],
+    spe: v[3],
+    id: formulaCell.id,
+  });
+
+  writeExecFunctionGlobalDataCell(
+    ctx,
+    formulaCell.r,
+    formulaCell.c,
+    formulaCell.id,
+    {
+      v: v[1],
+      f: v[2],
+    },
+  );
+}
+
+function mergeFormulaDeps(
+  ctx: Context,
+  originKey: string,
+  deps: Iterable<string>,
+) {
+  const depSet = new Set(deps);
+  const prevDeps =
+    ctx.formulaCache.depsByCell.get(originKey) ?? new Set<string>();
+  ctx.formulaCache.depsByCell.set(originKey, depSet);
+  prevDeps.forEach((depKey) => {
+    if (depSet.has(depKey)) return;
+    const rev = ctx.formulaCache.revDepsByCell.get(depKey);
+    if (!rev) return;
+    rev.delete(originKey);
+    if (rev.size === 0) ctx.formulaCache.revDepsByCell.delete(depKey);
+  });
+  depSet.forEach((depKey) => {
+    if (prevDeps.has(depKey)) return;
+    const rev = ctx.formulaCache.revDepsByCell.get(depKey) ?? new Set<string>();
+    rev.add(originKey);
+    ctx.formulaCache.revDepsByCell.set(depKey, rev);
+  });
+  invalidateSheetsRequiredDenseCache();
+}
+
+/** Apply worker chunk output onto the live context (main thread only). */
+export function applyWorkerFormulaChunkResults(
+  ctx: Context,
+  output: SnapshotEvalOutput,
+  impactedByCircular: Set<string>,
+  cycleNodes: Set<string>,
+  calcChainKeys: string[] = [],
+  data?: CellMatrix | null,
+) {
+  ensureExecFunctionGlobalData(ctx);
+  const calcChainSet = new Set(calcChainKeys);
+
+  for (const result of output.results) {
+    const formulaCellKey = `${result.id}:${result.r}:${result.c}`;
+
+    if (impactedByCircular.has(formulaCellKey)) {
+      const isInCycle = cycleNodes.has(formulaCellKey);
+      const message = isInCycle
+        ? 'Circular dependency.'
+        : 'Circular dependency (upstream).';
+      setCellError(ctx, result.r, result.c, {
+        row_column: `${result.r}_${result.c}`,
+        title: CIRCULAR_REF_TITLE,
+        message,
+      });
+      ctx.groupValuesRefreshData.push({
+        r: result.r,
+        c: result.c,
+        v: CIRCULAR_REF_ERROR,
+        f: result.f,
+        id: result.id,
+      });
+      writeExecFunctionGlobalDataCell(ctx, result.r, result.c, result.id, {
+        v: CIRCULAR_REF_ERROR,
+        f: result.f,
+      });
+      continue;
+    }
+
+    if (Array.isArray(result.v)) {
+      evalFormulaCellInGroup(
+        ctx,
+        {
+          r: result.r,
+          c: result.c,
+          id: result.id,
+          calc_funcStr: result.f,
+        },
+        calcChainSet,
+        data,
+        impactedByCircular,
+        cycleNodes,
+      );
+      continue;
+    }
+
+    mergeFormulaDeps(ctx, formulaCellKey, result.deps);
+
+    if (result.isError) {
+      setCellError(ctx, result.r, result.c, {
+        row_column: `${result.r}_${result.c}`,
+        title: 'Error',
+        message: String(result.v ?? 'Unknown Error'),
+      });
+    } else {
+      clearCellError(ctx, result.r, result.c);
+    }
+
+    ctx.groupValuesRefreshData.push({
+      r: result.r,
+      c: result.c,
+      v: result.v,
+      f: result.f,
+      id: result.id,
+    });
+    writeExecFunctionGlobalDataCell(ctx, result.r, result.c, result.id, {
+      v: result.v,
+      f: result.f,
+    });
+  }
+}
+
+/** Run up to `chunkSize` formulas from an async job. Returns true when job is complete. */
+export function runFormulaEvalChunk(
+  ctx: Context,
+  job: FormulaAsyncEvalJob,
+  chunkSize = FORMULA_ASYNC_CHUNK_SIZE,
+): boolean {
+  ensureExecFunctionGlobalData(ctx);
+  const calcChainSet = new Set(job.calcChainKeys);
+  const impactedByCircular = new Set(job.impactedByCircular);
+  const cycleNodes = new Set(job.cycleNodes);
+  const data = getFlowdata(ctx);
+  const end = Math.min(job.nextIndex + chunkSize, job.formulaRunList.length);
+
+  for (let i = job.nextIndex; i < end; i += 1) {
+    const formulaCell = job.formulaRunList[i];
+    evalFormulaCellInGroup(
+      ctx,
+      formulaCell,
+      calcChainSet,
+      data,
+      impactedByCircular,
+      cycleNodes,
+    );
+  }
+
+  job.nextIndex = end;
+  const complete = end >= job.formulaRunList.length;
+  if (complete) {
+    ctx.formulaCache.execFunctionExist = undefined;
+    clearRangeValuePassCache(ctx.formulaCache);
+    ctx.formulaCache.execFunctionGlobalData = null;
+  }
+  return complete;
+}
+
+/**
+ * Re-evaluate formula cells that reference the given defined names
+ * (e.g. after a named range was edited, shifted, or deleted).
+ */
+export function refreshFormulasUsingDefinedNames(
+  ctx: Context,
+  names: string[],
+) {
+  if (!names.length) return;
+  const patterns = names
+    .map((n) => n.trim())
+    .filter(Boolean)
+    .map(
+      (n) =>
+        new RegExp(
+          `(^|[^A-Za-z0-9_.])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^A-Za-z0-9_.])`,
+          'i',
+        ),
+    );
+  if (!patterns.length) return;
+
+  const calcChains = getAllFunctionGroup(ctx);
+  const touched: { r: number; c: number; i: string }[] = [];
+  for (let i = 0; i < calcChains.length; i += 1) {
+    const cell = calcChains[i];
+    const f = getcellFormula(ctx, cell.r, cell.c, cell.id);
+    if (!f) continue;
+    if (!patterns.some((re) => re.test(f))) continue;
+    touched.push({ r: cell.r, c: cell.c, i: cell.id! });
+  }
+  if (!touched.length) return;
+
+  ctx.formulaCache.execFunctionExist = touched;
+  // @ts-expect-error: full named-range refresh passes null for origin
+  execFunctionGroup(ctx, null, null, null, null, getFlowdata(ctx));
+  ctx.formulaCache.execFunctionExist = undefined;
 }
 
 export function execFunctionGroup(
@@ -1784,6 +2440,10 @@ export function execFunctionGroup(
 ) {
   if (_.isNil(data)) {
     data = getFlowdata(ctx);
+  }
+
+  if (_.isNil(id)) {
+    id = ctx.currentSheetId;
   }
 
   // if (!window.luckysheet_compareWith) {
@@ -1802,12 +2462,8 @@ export function execFunctionGroup(
   // Start each group execution with a fresh pass-local cache so circular
   // propagation only reads values produced in the current recalculation pass.
   ctx.formulaCache.execFunctionGlobalData = {};
+  beginRangeValuePassCache(ctx.formulaCache);
   // let luckysheetfile = getluckysheetfile();
-  // let dynamicArray_compute = luckysheetfile[getSheetIndex(ctx.currentSheetId)_.isNil(]["dynamicArray_compute"]) ? {} : luckysheetfile[getSheetIndex(ctx.currentSheetId)]["dynamicArray_compute"];
-
-  if (_.isNil(id)) {
-    id = ctx.currentSheetId;
-  }
 
   const originKey = `${id}:${origin_r}:${origin_c}`;
   const cycleNodes = findCycleNodesFrom(originKey, ctx.formulaCache.depsByCell);
@@ -1823,7 +2479,7 @@ export function execFunctionGroup(
     [
       [
         ctx.formulaCache.execFunctionGlobalData[
-          `${origin_r}_${origin_c}_${id}`
+        `${origin_r}_${origin_c}_${id}`
         ],
       ],
     ] = cellCache;
@@ -1831,6 +2487,60 @@ export function execFunctionGroup(
 
   // { "r": r, "c": c, "id": id, "func": func}
   const calcChains = getAllFunctionGroup(ctx);
+  let calcChainsToProcess = calcChains;
+  if (
+    !isForce &&
+    !_.isNil(origin_r) &&
+    !_.isNil(origin_c) &&
+    !_.isNil(id) &&
+    ctx.formulaCache.revDepsByCell.size > 0
+  ) {
+    const dependents = collectTransitiveFormulaDependents(
+      originKey,
+      ctx.formulaCache.revDepsByCell,
+    );
+    ctx.formulaCache.formulasWithWideRangeDeps.forEach((formulaKey) => {
+      dependents.add(formulaKey);
+    });
+    // Cold dep graph / named-range-only formulas: if the edited cell sits inside
+    // a defined name, include calc-chain formulas that mention that name.
+    const coveringNames = (ctx.definedNames || []).filter(
+      (dn) =>
+        dn.sheetId === id &&
+        origin_r >= dn.range.row[0] &&
+        origin_r <= dn.range.row[1] &&
+        origin_c >= dn.range.column[0] &&
+        origin_c <= dn.range.column[1],
+    );
+    if (coveringNames.length > 0) {
+      const nameKeys = coveringNames.map((dn) => dn.name.toLowerCase());
+      for (let i = 0; i < calcChains.length; i += 1) {
+        const cell = calcChains[i];
+        const formulaKey = `${cell.id}:${cell.r}:${cell.c}`;
+        if (dependents.has(formulaKey)) continue;
+        const f = getcellFormula(ctx, cell.r, cell.c, cell.id);
+        if (!f) continue;
+        const upper = f.toUpperCase();
+        for (let n = 0; n < nameKeys.length; n += 1) {
+          const name = nameKeys[n];
+          // Case-insensitive whole-token match (avoid matching prefixes).
+          const re = new RegExp(
+            `(^|[^A-Z0-9_.])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^A-Z0-9_.])`,
+            'i',
+          );
+          if (re.test(upper)) {
+            dependents.add(formulaKey);
+            break;
+          }
+        }
+      }
+    }
+    if (dependents.size > 0) {
+      calcChainsToProcess = calcChains.filter((cell) =>
+        dependents.has(`${cell.id}:${cell.r}:${cell.c}`),
+      );
+    }
+  }
   const formulaObjects: any = {};
 
   const sheets = ctx.luckysheetfile;
@@ -1902,8 +2612,8 @@ export function execFunctionGroup(
 
   // 创建公式缓存及其范围的缓存
   // console.time("1");
-  for (let i = 0; i < calcChains.length; i += 1) {
-    const formulaCell = calcChains[i];
+  for (let i = 0; i < calcChainsToProcess.length; i += 1) {
+    const formulaCell = calcChainsToProcess[i];
     const key = `r${formulaCell.r}c${formulaCell.c}i${formulaCell.id}`;
     const calc_funcStr = getcellFormula(
       ctx,
@@ -2045,9 +2755,26 @@ export function execFunctionGroup(
         }
 
         if (
-          (t.substring(0, 1) === '"' && t.substring(t.length - 1, 1) === '"') ||
-          !iscelldata(t)
+          t.substring(0, 1) === '"' &&
+          t.substring(t.length - 1, 1) === '"'
         ) {
+          continue;
+        }
+
+        if (!iscelldata(t)) {
+          // Named ranges are not A1 tokens; resolve so dependents still recalculate.
+          const dn = resolveDefinedNameForFormula(
+            ctx.definedNames,
+            _.trim(t),
+            formulaCell.id,
+          );
+          if (dn) {
+            formulaArray.push({
+              row: [dn.range.row[0], dn.range.row[1]],
+              column: [dn.range.column[0], dn.range.column[1]],
+              sheetId: dn.sheetId,
+            });
+          }
           continue;
         }
 
@@ -2115,6 +2842,37 @@ export function execFunctionGroup(
     }
   });
 
+  // Named ranges (and other non-A1 refs) never appear in formulaArray, so the
+  // text-scan above misses them. Seed the run list from the reverse dep graph
+  // recorded during execfunction / callVariable.
+  if (
+    !isForce &&
+    !_.isNil(origin_r) &&
+    !_.isNil(origin_c) &&
+    !_.isNil(id) &&
+    ctx.formulaCache.revDepsByCell.size > 0
+  ) {
+    const depDependents = collectTransitiveFormulaDependents(
+      originKey,
+      ctx.formulaCache.revDepsByCell,
+    );
+    ctx.formulaCache.formulasWithWideRangeDeps.forEach((formulaKey) => {
+      depDependents.add(formulaKey);
+    });
+    if (depDependents.size > 0) {
+      const alreadyQueued = new Set(
+        updateValueArray.map((fo: { key: string }) => fo.key),
+      );
+      Object.keys(formulaObjects).forEach((key) => {
+        if (alreadyQueued.has(key)) return;
+        const fo = formulaObjects[key];
+        if (depDependents.has(`${fo.id}:${fo.r}:${fo.c}`)) {
+          updateValueArray.push(fo);
+        }
+      });
+    }
+  }
+
   // console.log(formulaObjects)
   // console.timeEnd("2");
 
@@ -2171,109 +2929,55 @@ export function execFunctionGroup(
   // console.timeEnd("3");
 
   // console.time("4");
+  if (formulaRunList.length >= FORMULA_ASYNC_EVAL_THRESHOLD) {
+    ctx.formulaAsyncEval = {
+      formulaRunList: formulaRunList.map((f: any) => ({
+        r: f.r,
+        c: f.c,
+        id: f.id,
+        calc_funcStr: f.calc_funcStr,
+        level: f.level,
+      })),
+      calcChainKeys: Array.from(calcChainSet),
+      impactedByCircular: Array.from(impactedByCircular),
+      cycleNodes: Array.from(cycleNodes),
+      workerSnapshotKey: `formula-job-${(formulaAsyncEvalJobId += 1)}`,
+      nextIndex: 0,
+      total: formulaRunList.length,
+      debug: {
+        mode: 'main-thread',
+        lastChunkMs: 0,
+        lastChunkSize: 0,
+        completedChunks: 0,
+        fallbackChunks: 0,
+        workerAvailable: false,
+        unsafeFormulaCount: 0,
+        workerFormulaCount: 0,
+        totalWorkerFormulas: 0,
+        totalMainThreadFormulas: 0,
+        lastError: null,
+      },
+    };
+    ctx.isFormulaCalculating = true;
+    return;
+  }
+
   for (let i = 0; i < formulaRunList.length; i += 1) {
     const formulaCell = formulaRunList[i];
-    if (formulaCell.level === Math.max) {
-      continue;
-    }
-
-    const { calc_funcStr } = formulaCell;
-
-    const formulaCellKey = `${formulaCell.id}:${formulaCell.r}:${formulaCell.c}`;
-    if (impactedByCircular.has(formulaCellKey)) {
-      const isInCycle = cycleNodes.has(formulaCellKey);
-      const message = isInCycle
-        ? 'Circular dependency.'
-        : 'Circular dependency (upstream).';
-      setCellError(ctx, formulaCell.r, formulaCell.c, {
-        row_column: `${formulaCell.r}_${formulaCell.c}`,
-        title: CIRCULAR_REF_TITLE,
-        message,
-      });
-
-      ctx.groupValuesRefreshData.push({
-        r: formulaCell.r,
-        c: formulaCell.c,
-        v: CIRCULAR_REF_ERROR,
-        f: calc_funcStr,
-        id: formulaCell.id,
-      });
-
-      ctx.formulaCache.execFunctionGlobalData[
-        `${formulaCell.r}_${formulaCell.c}_${formulaCell.id}`
-      ] = {
-        v: CIRCULAR_REF_ERROR,
-        f: calc_funcStr,
-      };
-
-      continue;
-    }
-
-    const v = execfunction(
+    evalFormulaCellInGroup(
       ctx,
-      calc_funcStr,
-      formulaCell.r,
-      formulaCell.c,
-      formulaCell.id,
+      formulaCell,
       calcChainSet,
+      data,
+      impactedByCircular,
+      cycleNodes,
     );
-
-    const valueData = v?.[1];
-    const valueFunction = v?.[2];
-
-    if (Array.isArray(valueData)) {
-      // spill to grid
-      const spilled = spillSortResult(
-        ctx,
-        formulaCell.r,
-        formulaCell.c,
-        { v: valueData, f: valueFunction },
-        data, // flowdata for this sheet
-      );
-
-      if (spilled) {
-        const matrixTopLeftValue = Array.isArray(valueData[0])
-          ? valueData[0][0]
-          : valueData[0];
-
-        ctx.groupValuesRefreshData.push({
-          r: formulaCell.r,
-          c: formulaCell.c,
-          v: matrixTopLeftValue,
-          f: valueFunction,
-          spe: v[3],
-          id: formulaCell.id,
-        });
-
-        ctx.formulaCache.execFunctionGlobalData[
-          `${formulaCell.r}_${formulaCell.c}_${formulaCell.id}`
-        ] = { v: matrixTopLeftValue, f: valueFunction };
-
-        continue;
-      }
-    }
-
-    ctx.groupValuesRefreshData.push({
-      r: formulaCell.r,
-      c: formulaCell.c,
-      v: v[1],
-      f: v[2],
-      spe: v[3],
-      id: formulaCell.id,
-    });
-
-    // _this.execFunctionGroupData[u.r][u.c] = value;
-    ctx.formulaCache.execFunctionGlobalData[
-      `${formulaCell.r}_${formulaCell.c}_${formulaCell.id}`
-    ] = {
-      v: v[1],
-      f: v[2],
-    };
   }
   // console.log(formulaRunList);
   // console.timeEnd("4");
 
   ctx.formulaCache.execFunctionExist = undefined;
+  clearRangeValuePassCache(ctx.formulaCache);
 }
 
 function findrangeindex(ctx: Context, v: string, vp: string) {
@@ -2520,6 +3224,42 @@ export function seedFormulaFuncSelectedRangeFromLastSelection(
   return true;
 }
 
+/**
+ * Explicit reference selection (F2) with the caret on an existing reference:
+ * seed the keyboard range from *that reference*, so the first arrow moves it
+ * from where it is (`=SUM(A1|)` + Right -> `=SUM(B1)`), not from the edited
+ * cell. Replaces any stale `func_selectedrange`. Returns false when the caret
+ * is not on a complete reference on the visible sheet.
+ */
+export function seedFormulaFuncSelectedRangeFromTouchedReference(
+  ctx: Context,
+): boolean {
+  const editor = getActiveFormulaEditorElement(ctx);
+  if (!editor) return false;
+  const caret = getCaretOffsetInEditor(editor);
+  if (caret === null) return false;
+  const text = normalizeFormulaBoundaryText(editor.textContent || '');
+  const touched = getCaretContext(tokenizeFormula(text), caret).touchingRef;
+  if (!touched || touched.partial) return false;
+  const range = getcellrange(ctx, touched.text);
+  if (!range || range.sheetId !== ctx.currentSheetId) return false;
+
+  const previous = ctx.formulaCache.func_selectedrange;
+  ctx.formulaCache.func_selectedrange = undefined;
+  if (!seedFormulaFuncSelectedRangeFromLastSelection(ctx)) {
+    ctx.formulaCache.func_selectedrange = previous;
+    return false;
+  }
+  const seeded = ctx.formulaCache.func_selectedrange!;
+  seeded.row = [...range.row];
+  seeded.column = [...range.column];
+  // Focus on the far corner: that is the end an arrow moves.
+  seeded.row_focus = range.row[1];
+  seeded.column_focus = range.column[1];
+  seeded.moveXY = undefined;
+  return true;
+}
+
 export function createFormulaRangeSelect(
   ctx: Context,
   select: { rangeIndex: number } & Rect,
@@ -2568,7 +3308,7 @@ export function createRangeHightlight(
           formulaRanges.push({
             rangeIndex,
             ...rect,
-            backgroundColor: colors[rangeIndex],
+            backgroundColor: getRangeColor(rangeIndex),
           });
         }
       }
@@ -2974,7 +3714,7 @@ function helpFunctionExe(
       if (
         $cur?.classList?.contains('luckysheet-formula-text-func') ||
         _.trim($cur.textContent || '').toUpperCase() in
-          ctx.formulaCache.functionlistMap
+        ctx.formulaCache.functionlistMap
       ) {
         funcName = $cur.textContent;
         paramindex = null;
@@ -3080,7 +3820,7 @@ function functionHTML(txt: string) {
     braces: 0,
   };
 
-  const appendStrTail = (acc: string, dquote: number) => {
+  const appendStrTail = (acc: string, dquote: number, squote: number) => {
     if (acc.length === 0) {
       return;
     }
@@ -3093,7 +3833,12 @@ function functionHTML(txt: string) {
     let trailingWS = '';
     if (dquote === 0) {
       leadingWS = acc.match(/^\s+/)?.[0] || '';
-      trailingWS = acc.match(/\s+$/)?.[0] || '';
+      // Inside an unclosed single quote (e.g. typing `='Finance ` of
+      // `'Finance - 1'!A1`) trailing spaces belong to the sheet name. Moving
+      // them outside the span shifts the caret before the space, so the next
+      // keystroke lands in the wrong spot and the name collapses to
+      // `Finance-1`.
+      trailingWS = squote > 0 ? '' : acc.match(/\s+$/)?.[0] || '';
       acc = acc.slice(leadingWS.length, acc.length - trailingWS.length);
       if (acc.length === 0) {
         // The whole tail was only whitespace (often a lone `\n` from the
@@ -3108,7 +3853,7 @@ function functionHTML(txt: string) {
         rangeIndexes.length > functionHTMLIndex
           ? rangeIndexes[functionHTMLIndex]
           : functionHTMLIndex;
-      function_str += `<span class="fortune-formula-functionrange-cell" rangeindex="${rangeIndex}" dir="auto" style="color:${colors[rangeIndex]};">${acc}</span>`;
+      function_str += `<span class="fortune-formula-functionrange-cell" rangeindex="${rangeIndex}" dir="auto" style="color:${getRangeColor(rangeIndex)};">${acc}</span>`;
       functionHTMLIndex += 1;
     } else if (dquote > 0) {
       function_str += `${acc}</span>`;
@@ -3304,7 +4049,7 @@ function functionHTML(txt: string) {
     }
 
     if (i === funcstack.length - 1) {
-      appendStrTail(str, matchConfig.dquote);
+      appendStrTail(str, matchConfig.dquote, matchConfig.squote);
     }
 
     i += 1;
@@ -3456,6 +4201,119 @@ export function getFormulaEditorOwner(ctx: Context): 'cell' | 'fx' | null {
   return null;
 }
 
+/**
+ * Record the sheet where the formula edit started so cross-sheet picks can emit
+ * `SheetName!A1` via `rangeSetValue` / `getRangetxt`.
+ */
+export function ensureFormulaRangeToSheet(ctx: Context) {
+  if (!ctx.formulaCache.rangetosheet) {
+    ctx.formulaCache.rangetosheet = ctx.currentSheetId;
+  }
+}
+
+/** True while an in-cell / fx formula edit should survive sheet-tab switches. */
+export function shouldPreserveFormulaEditOnSheetSwitch(ctx: Context): boolean {
+  if (ctx.luckysheetCellUpdate.length === 0) return false;
+  if (ctx.formulaCache.rangetosheet) return true;
+  const editor = getActiveFormulaEditorElement(ctx);
+  return (editor?.innerText || '').trim().startsWith('=');
+}
+
+function saveCurrentSheetViewState(ctx: Context) {
+  ctx.sheetScrollRecord[ctx.currentSheetId] = {
+    scrollLeft: ctx.scrollLeft,
+    scrollTop: ctx.scrollTop,
+    luckysheet_select_status: ctx.luckysheet_select_status,
+    luckysheet_select_save: ctx.luckysheet_select_save,
+    luckysheet_selection_range: ctx.luckysheet_selection_range,
+  };
+}
+
+function clearFormulaPickStateOnSheetSwitch(ctx: Context) {
+  ctx.formulaCache.formulaKeyboardRefSync = false;
+  ctx.formulaCache.func_selectedrange = undefined;
+  ctx.formulaCache.rangestart = false;
+  ctx.formulaCache.rangedrag_column_start = false;
+  ctx.formulaCache.rangedrag_row_start = false;
+  ctx.formulaCache.rangechangeindex = undefined;
+  ctx.formulaRangeSelect = undefined;
+  ctx.formulaCache.refocusFormulaEditorAfterSheetSwitch = true;
+}
+
+/**
+ * Activate another sheet from tab click or Alt/Option+Arrow navigation.
+ * Returns whether the sheet changed and whether formula edit was preserved.
+ */
+export function activateSheetForNavigation(
+  ctx: Context,
+  targetSheetId: string,
+): 'preserved-formula' | 'cancel-edit' | false {
+  if (!targetSheetId || targetSheetId === ctx.currentSheetId) return false;
+
+  const preserveFormula = shouldPreserveFormulaEditOnSheetSwitch(ctx);
+  if (preserveFormula) {
+    // Capture origin sheet before `currentSheetId` changes.
+    ensureFormulaRangeToSheet(ctx);
+  }
+
+  saveCurrentSheetViewState(ctx);
+  ctx.dataVerificationDropDownList = false;
+
+  const targetIdx = getSheetIndex(ctx, targetSheetId);
+  const targetFile = targetIdx != null ? ctx.luckysheetfile[targetIdx] : undefined;
+
+  changeSheet(ctx, targetSheetId);
+
+  if (targetFile?.zoomRatio != null) {
+    ctx.zoomRatio = targetFile.zoomRatio || 1;
+  }
+
+  if (preserveFormula) {
+    clearFormulaPickStateOnSheetSwitch(ctx);
+    return 'preserved-formula';
+  }
+  return 'cancel-edit';
+}
+
+/**
+ * Switch back to the formula's origin sheet (and restore its scroll/selection)
+ * before commit or cancel. Returns true when a switch happened.
+ */
+export function returnToFormulaOriginSheet(ctx: Context): boolean {
+  const origin = ctx.formulaCache.rangetosheet;
+  if (!origin || origin === ctx.currentSheetId) return false;
+
+  ctx.sheetScrollRecord[ctx.currentSheetId] = {
+    scrollLeft: ctx.scrollLeft,
+    scrollTop: ctx.scrollTop,
+    luckysheet_select_status: ctx.luckysheet_select_status,
+    luckysheet_select_save: ctx.luckysheet_select_save,
+    luckysheet_selection_range: ctx.luckysheet_selection_range,
+  };
+
+  changeSheet(ctx, origin);
+
+  // Ensure origin is dense before commit paths read/write flowdata.
+  ensureSheetFlowdata(ctx, { id: origin });
+
+  const saved = ctx.sheetScrollRecord[origin];
+  if (saved) {
+    ctx.scrollLeft = saved.scrollLeft ?? 0;
+    ctx.scrollTop = saved.scrollTop ?? 0;
+    ctx.luckysheet_select_status = saved.luckysheet_select_status ?? false;
+    if (saved.luckysheet_select_save) {
+      ctx.luckysheet_select_save = saved.luckysheet_select_save;
+    }
+  }
+
+  const file = ctx.luckysheetfile[getSheetIndex(ctx, origin)!];
+  if (file?.zoomRatio != null) {
+    ctx.zoomRatio = file.zoomRatio || 1;
+  }
+
+  return true;
+}
+
 function getActiveFormulaEditorElement(ctx: Context): HTMLDivElement | null {
   const cellEditor = document.getElementById(
     'luckysheet-rich-text-editor',
@@ -3550,9 +4408,15 @@ export function isBareCellOrRangeOnlyFormula(formulaText: string): boolean {
  * disable sheet-driven range selection until the caret reaches a fresh insertion slot
  * (comma, open paren, operator, etc.) or the user starts an active range drag.
  */
-export function suppressFormulaRangeSelectionForInitialEdit(ctx: Context) {
+export function suppressFormulaRangeSelectionForInitialEdit(
+  ctx: Context,
+  cell?: [number, number],
+) {
   ctx.formulaCache.rangeSelectionActive = false;
   ctx.formulaCache.keyboardRangeSelectionLock = true;
+  ctx.formulaCache.arrowAutoAllowed = false;
+  ctx.formulaCache.arrowOverride = null;
+  ctx.formulaCache.arrowSessionCell = cell;
   ctx.formulaCache.rangestart = false;
   ctx.formulaCache.rangedrag_column_start = false;
   ctx.formulaCache.rangedrag_row_start = false;
@@ -3594,6 +4458,17 @@ export function isCaretAtValidFormulaRangeInsertionPoint(
   const caretOffset = normalizeFormulaBoundaryText(
     preCaretRange.toString(),
   ).length;
+  // Use textContent (matches `caretOffset` from Range.toString().length).
+  // innerText would shift these indices by 1 per <br> in multi-line formulas.
+  const fullText = normalizeFormulaBoundaryText(editor.textContent || '');
+
+  // `)` closes a group/call — never a ref insertion point, whether at EOF or
+  // mid-formula (e.g. `=SUM(A1)|+B1`). Previously only the EOF branch checked
+  // this; the mid-formula path only inspected the char *after* the caret.
+  if (getSignificantCharBeforeCaret(fullText, caretOffset) === ')') {
+    return false;
+  }
+
   const slotTextBeforeCaret = getCurrentFormulaSlotTextBeforeCaret(
     editor,
     caretOffset,
@@ -3610,9 +4485,6 @@ export function isCaretAtValidFormulaRangeInsertionPoint(
     return false;
   }
 
-  // Use textContent (matches `caretOffset` from Range.toString().length).
-  // innerText would shift these indices by 1 per <br> in multi-line formulas.
-  const fullText = normalizeFormulaBoundaryText(editor.textContent || '');
   const textAfter = fullText.slice(caretOffset);
   const remaining = textAfter.replace(/^\s+/, '');
   if (remaining.length === 0) {
@@ -3620,16 +4492,13 @@ export function isCaretAtValidFormulaRangeInsertionPoint(
     if (atCaret !== null) {
       return true;
     }
-    const textBefore = fullText.slice(0, caretOffset).trimEnd();
-    const lastCh = textBefore.slice(-1);
+    const lastCh = getSignificantCharBeforeCaret(fullText, caretOffset);
     if (!lastCh) {
-      return false;
-    }
-    if (lastCh === ')') {
       return false;
     }
     // At end-of-formula: only after `=`, `,`, `(`, or an infix operator is it valid to start
     // or extend refs via keyboard/mouse — same idea as blocking bare `=A1` / `=A1:A2`.
+    // (`)` already rejected above.)
     if (/^[=,(+\-*/&%^<>]$/.test(lastCh)) {
       return true;
     }
@@ -3692,7 +4561,12 @@ export function getFormulaRangeIndexForKeyboardSync(
   if (!cell) return null;
 
   const sel = window.getSelection();
-  if (!sel?.anchorNode) return lastIdx;
+  // Focus often leaves the formula editor after a sheet-tab switch. Without a
+  // caret inside the editor, still update the sole/last managed ref (needed for
+  // bare `=Sheet2!A1` continued keyboard nav).
+  if (!sel?.anchorNode || !$editor.contains(sel.anchorNode)) {
+    return lastIdx;
+  }
 
   const caretRange = document.createRange();
   try {
@@ -3709,8 +4583,12 @@ export function getFormulaRangeIndexForKeyboardSync(
     return lastIdx;
   }
 
-  if (caretRange.compareBoundaryPoints(Range.START_TO_START, cellRange) < 0) {
-    return null;
+  try {
+    if (caretRange.compareBoundaryPoints(Range.START_TO_START, cellRange) < 0) {
+      return null;
+    }
+  } catch {
+    return lastIdx;
   }
 
   const afterCell = document.createRange();
@@ -3721,10 +4599,14 @@ export function getFormulaRangeIndexForKeyboardSync(
     return lastIdx;
   }
 
-  if (caretRange.compareBoundaryPoints(Range.START_TO_START, afterCell) >= 0) {
-    if (hasCommaOrAnotherRefAfterRangeCell(cell)) {
-      return null;
+  try {
+    if (caretRange.compareBoundaryPoints(Range.START_TO_START, afterCell) >= 0) {
+      if (hasCommaOrAnotherRefAfterRangeCell(cell)) {
+        return null;
+      }
+      return lastIdx;
     }
+  } catch {
     return lastIdx;
   }
 
@@ -3746,10 +4628,7 @@ export function handleFormulaInput(
     }
 
     const isBackspaceOrDelete = kcode === 8 || kcode === 46;
-    const isAlphaNumeric =
-      (kcode >= 48 && kcode <= 57) || // 0-9
-      (kcode >= 65 && kcode <= 90) || // A-Z
-      (kcode >= 97 && kcode <= 122); // a-z
+    const isAlphaNumeric = isReferenceDirtyingKeyCode(kcode);
 
     // If a keyboard/mouse-inserted range token is currently being edited
     // and the user types characters (or backspace/delete), mark it as
@@ -3757,6 +4636,10 @@ export function handleFormulaInput(
     if (ctx.formulaCache.rangeSelectionActive === true) {
       if (isBackspaceOrDelete || isAlphaNumeric) {
         markRangeSelectionDirty(ctx);
+      } else if (isTextChangingKeyCode(kcode)) {
+        // Operator / comma / space etc: the arrow-driven reference is finished.
+        // The next mode is derived from the caret position (e.g. `+` -> READY).
+        ctx.formulaCache.rangeSelectionActive = null;
       }
     }
 
@@ -3798,6 +4681,7 @@ export function handleFormulaInput(
       value.substring(0, 1) === '=' &&
       (kcode !== 229 || value.length === 1)
     ) {
+      ensureFormulaRangeToSheet(ctx);
       if (!refreshRangeSelect) rangeIndexes = getRangeIndexes($editor);
       value = functionHTMLGenerate(value);
       if (!refreshRangeSelect && functionHTMLIndex < rangeIndexes.length)
@@ -3922,9 +4806,8 @@ function cycleSingleA1RefLock(ref: string): string | null {
     nextColAbs = false;
     nextRowAbs = false;
   }
-  return `${sheetPrefix}${nextColAbs ? '$' : ''}${col.toUpperCase()}${
-    nextRowAbs ? '$' : ''
-  }${row}`;
+  return `${sheetPrefix}${nextColAbs ? '$' : ''}${col.toUpperCase()}${nextRowAbs ? '$' : ''
+    }${row}`;
 }
 
 function cycleReferenceLockToken(refText: string): string | null {
@@ -4133,13 +5016,11 @@ function functionStrChange_range(
       return `${prefix + $row0 + (r1 + 1)}:${$row1}${r2 + 1}`;
     }
     if (Number.isNaN(r1) && Number.isNaN(r2)) {
-      return `${
-        prefix + $col0 + indexToColumnChar(c1)
-      }:${$col1}${indexToColumnChar(c2)}`;
+      return `${prefix + $col0 + indexToColumnChar(c1)
+        }:${$col1}${indexToColumnChar(c2)}`;
     }
-    return `${
-      prefix + $col0 + indexToColumnChar(c1) + $row0 + (r1 + 1)
-    }:${$col1}${indexToColumnChar(c2)}${$row1}${r2 + 1}`;
+    return `${prefix + $col0 + indexToColumnChar(c1) + $row0 + (r1 + 1)
+      }:${$col1}${indexToColumnChar(c2)}${$row1}${r2 + 1}`;
   }
   if (type === 'add') {
     if (rc === 'row') {
@@ -4196,13 +5077,11 @@ function functionStrChange_range(
       return `${prefix + $row0 + (r1 + 1)}:${$row1}${r2 + 1}`;
     }
     if (Number.isNaN(r1) && Number.isNaN(r2)) {
-      return `${
-        prefix + $col0 + indexToColumnChar(c1)
-      }:${$col1}${indexToColumnChar(c2)}`;
+      return `${prefix + $col0 + indexToColumnChar(c1)
+        }:${$col1}${indexToColumnChar(c2)}`;
     }
-    return `${
-      prefix + $col0 + indexToColumnChar(c1) + $row0 + (r1 + 1)
-    }:${$col1}${indexToColumnChar(c2)}${$row1}${r2 + 1}`;
+    return `${prefix + $col0 + indexToColumnChar(c1) + $row0 + (r1 + 1)
+      }:${$col1}${indexToColumnChar(c2)}${$row1}${r2 + 1}`;
   }
   return '';
 }
@@ -4320,16 +5199,6 @@ export function israngeseleciton(ctx: Context, istooltip?: boolean) {
   const parentElement = anchor.parentNode as HTMLElement;
 
   const allowRangeInsertionAtCaret = () => {
-    // If range selection flow is already active, allow insertion/replacement.
-    if (
-      ctx.formulaCache.rangestart ||
-      ctx.formulaCache.rangedrag_column_start ||
-      ctx.formulaCache.rangedrag_row_start ||
-      ctx.formulaCache.rangeSelectionActive === true
-    ) {
-      return true;
-    }
-
     const editor =
       (anchorElement.closest?.(
         '#luckysheet-rich-text-editor, #luckysheet-functionbox-cell',
@@ -4340,6 +5209,20 @@ export function israngeseleciton(ctx: Context, istooltip?: boolean) {
       (document.getElementById(
         'luckysheet-rich-text-editor',
       ) as HTMLElement | null);
+
+    // Active range flow may continue updating a managed ref under the caret,
+    // but must not bypass caret validation when the caret has moved to an
+    // invalid slot (e.g. just after `)` → `=SUM(A1)|+B1`).
+    if (
+      editor &&
+      (ctx.formulaCache.rangestart ||
+        ctx.formulaCache.rangedrag_column_start ||
+        ctx.formulaCache.rangedrag_row_start ||
+        ctx.formulaCache.rangeSelectionActive === true) &&
+      getFormulaRangeIndexAtCaret(editor as HTMLDivElement) !== null
+    ) {
+      return true;
+    }
 
     return isCaretAtValidFormulaRangeInsertionPoint(editor);
   };
@@ -4484,66 +5367,106 @@ export function israngeseleciton(ctx: Context, istooltip?: boolean) {
   return false;
 }
 
-// Single source of truth for whether the caret is currently in a
-// "formula reference selection" flow (i.e., where range tokens should be
-// inserted/updated by keyboard/mouse navigation).
+/**
+ * Start (or end) an arrow-key session with the defaults: automatic reference
+ * selection on, no F2 override. Call when a session opens on a cell that does
+ * not hold a formula, and when one ends.
+ */
+export function resetFormulaArrowSession(ctx: Context) {
+  ctx.formulaCache.arrowAutoAllowed = true;
+  ctx.formulaCache.arrowOverride = null;
+  ctx.formulaCache.arrowSessionCell = undefined;
+}
+
+/** The F2 override / auto flag in effect for the cell being edited right now. */
+export function getFormulaArrowSession(ctx: Context): {
+  override: FormulaArrowOverride;
+  autoAllowed: boolean;
+} {
+  const fc = ctx.formulaCache;
+  const owner = fc.arrowSessionCell;
+  const cur = ctx.luckysheetCellUpdate;
+  if (owner && (owner[0] !== cur[0] || owner[1] !== cur[1])) {
+    return { override: null, autoAllowed: true };
+  }
+  return {
+    override: fc.arrowOverride ?? null,
+    autoAllowed: fc.arrowAutoAllowed !== false,
+  };
+}
+
+/** F2 pressed while editing: store the new override for this cell's session. */
+export function setFormulaArrowOverride(
+  ctx: Context,
+  override: FormulaArrowOverride,
+) {
+  const { autoAllowed } = getFormulaArrowSession(ctx);
+  ctx.formulaCache.arrowAutoAllowed = autoAllowed;
+  ctx.formulaCache.arrowOverride = override;
+  const [row, col] = ctx.luckysheetCellUpdate;
+  ctx.formulaCache.arrowSessionCell =
+    row === undefined || col === undefined ? undefined : [row, col];
+}
+
+/** Caret offset inside `editor` (same space as `textContent`), or null when the selection is elsewhere. */
+function getCaretOffsetInEditor(editor: HTMLElement): number | null {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || !sel.focusNode) return null;
+  if (!editor.contains(sel.focusNode)) return null;
+  // The caret is the selection's focus. For a backward selection (Shift+Left)
+  // that is the range *start*, so `getRangeAt(0).endContainer` would be wrong.
+  const pre = document.createRange();
+  pre.selectNodeContents(editor);
+  pre.setEnd(sel.focusNode, sel.focusOffset);
+  return normalizeFormulaBoundaryText(pre.toString()).length;
+}
+
+/**
+ * Single source of truth for what an arrow key does while editing.
+ * Thin ctx/DOM adapter over the pure `resolveArrowMode`.
+ */
+export function getFormulaArrowMode(ctx: Context): FormulaArrowMode {
+  const editing = ctx.luckysheetCellUpdate.length > 0;
+  const editor = editing ? getActiveFormulaEditorElement(ctx) : null;
+  if (!editing || !editor) {
+    return resolveArrowMode({
+      editing: editing && !!editor,
+      text: '',
+      caretOffset: null,
+      override: null,
+      autoAllowed: true,
+      refActive: false,
+    });
+  }
+
+  const text = normalizeFormulaBoundaryText(editor.textContent || '');
+  const caretOffset = getCaretOffsetInEditor(editor);
+  const fc = ctx.formulaCache;
+
+  const dragging =
+    !!fc.rangestart || !!fc.rangedrag_column_start || !!fc.rangedrag_row_start;
+  // A reference the keyboard/mouse just inserted stays "active" while the caret
+  // is still on it (or focus has left the editor, e.g. after a sheet-tab switch).
+  const refActive =
+    dragging ||
+    (fc.rangeSelectionActive === true &&
+      (caretOffset === null ||
+        getFormulaRangeIndexAtCaret(editor) !== null ||
+        isBareCellOrRangeOnlyFormula(text)));
+
+  return resolveArrowMode({
+    editing: true,
+    text,
+    caretOffset,
+    ...getFormulaArrowSession(ctx),
+    refActive,
+  });
+}
+
+/** True while arrows should drive a cell reference (READY or ACTIVE). */
 export function isFormulaReferenceInputMode(ctx: Context): boolean {
-  const editor = getActiveFormulaEditorElement(ctx);
-  const inputText = (editor?.innerText || '').trim();
-  const hasActiveRangeDrag =
-    !!ctx.formulaCache.rangestart ||
-    !!ctx.formulaCache.rangedrag_column_start ||
-    !!ctx.formulaCache.rangedrag_row_start;
-  const caretAtValidInsertionPoint =
-    !!editor && isCaretAtValidFormulaRangeInsertionPoint(editor);
-
-  const refFlowActive =
-    hasActiveRangeDrag || ctx.formulaCache.rangeSelectionActive === true;
-
-  if (!inputText.startsWith('=')) {
-    return false;
-  }
-
-  // If a range was just inserted (kbd/mouse) and the caret is still on that
-  // managed range span, keep ref-input mode so arrow keys keep extending the
-  // range (e.g. `=A2` → arrow → `=A3`). This mirrors main's `refFlowActive`
-  // short-circuit and bypasses the bare-cell pattern check below for actively
-  // managed tokens. Dirty edits clear `rangeSelectionActive`, so this does not
-  // re-enable navigation after the user manually edited a token.
-  if (
-    ctx.formulaCache.rangeSelectionActive === true &&
-    editor &&
-    getFormulaRangeIndexAtCaret(editor as HTMLDivElement) !== null
-  ) {
-    return true;
-  }
-
-  // While user is still typing a function/identifier right after "="
-  // (e.g. "=SUM" or "=kjnskfv"), do not treat it as range-reference mode.
-  // Range-reference mode should start at insertion points such as "(" or ",".
-  if (/^=\s*[A-Za-z_][A-Za-z0-9_]*$/.test(inputText)) {
-    return false;
-  }
-
-  // Dirty/manual-edit mode is sticky for the current edit session: do not
-  // auto-recover range mode just because caret reaches a syntactically valid slot.
-  if (ctx.formulaCache.rangeSelectionActive === false) {
-    return false;
-  }
-
-  // During active mouse drag/resize keep range mode on; for non-drag keyboard
-  // states, still require caret to be at a valid insertion point.
-  if (refFlowActive) {
-    if (hasActiveRangeDrag) return true;
-    return caretAtValidInsertionPoint;
-  }
-
-  // Priority: valid caret entry point should reopen reference mode first.
-  if (caretAtValidInsertionPoint) {
-    return true;
-  }
-
-  return israngeseleciton(ctx);
+  const mode = getFormulaArrowMode(ctx);
+  return mode === 'REFERENCE_READY' || mode === 'REFERENCE_ACTIVE';
 }
 
 export function maybeRecoverDirtyRangeSelection(ctx: Context): boolean {
@@ -4805,8 +5728,8 @@ export function rangeSetValue(
     ctx.formulaCache.rangeSelectionActive === true;
   const spanToReplace = !_.isNil(ctx.formulaCache.rangechangeindex)
     ? ($editor.querySelector(
-        `span[rangeindex='${ctx.formulaCache.rangechangeindex}']`,
-      ) as HTMLSpanElement | null)
+      `span[rangeindex='${ctx.formulaCache.rangechangeindex}']`,
+    ) as HTMLSpanElement | null)
     : null;
 
   if (activeRangeFlow && spanToReplace) {
@@ -4925,7 +5848,7 @@ export function rangeSetValue(
       existingRangeIndexes.length > 0
         ? Math.max(...existingRangeIndexes) + 1
         : functionHTMLIndex;
-    const function_str = `<span class="fortune-formula-functionrange-cell" rangeindex="${nextRangeIndex}" dir="auto" style="color:${colors[nextRangeIndex]};">${range}</span>`;
+    const function_str = `<span class="fortune-formula-functionrange-cell" rangeindex="${nextRangeIndex}" dir="auto" style="color:${getRangeColor(nextRangeIndex)};">${range}</span>`;
     const newEle = parseElement(function_str) as HTMLSpanElement;
     let refEle = ctx.formulaCache.rangeSetValueTo;
     if (refEle && !refEle.parentNode) {
@@ -5453,13 +6376,11 @@ function updateparam(orient: string, txt: string, step: number) {
     return `${prefix + $row0 + row[0]}:${$row1}${row[1]}`;
   }
   if (Number.isNaN(row[0]) && Number.isNaN(row[1])) {
-    return `${
-      prefix + $col0 + indexToColumnChar(col[0])
-    }:${$col1}${indexToColumnChar(col[1])}`;
+    return `${prefix + $col0 + indexToColumnChar(col[0])
+      }:${$col1}${indexToColumnChar(col[1])}`;
   }
-  return `${
-    prefix + $col0 + indexToColumnChar(col[0]) + $row0 + row[0]
-  }:${$col1}${indexToColumnChar(col[1])}${$row1}${row[1]}`;
+  return `${prefix + $col0 + indexToColumnChar(col[0]) + $row0 + row[0]
+    }:${$col1}${indexToColumnChar(col[1])}${$row1}${row[1]}`;
 }
 
 function downparam(txt: string, step: number) {
@@ -5681,14 +6602,12 @@ export function remapFormulaReferencesByMap(
 
       const head = remapOne(col0, row0);
       if (_.isNil(col1) || _.isNil(row1)) {
-        return `${sheetPrefix || ''}${colAbs0}${head.nextCol}${rowAbs0}${
-          head.nextRow
-        }`;
+        return `${sheetPrefix || ''}${colAbs0}${head.nextCol}${rowAbs0}${head.nextRow
+          }`;
       }
       const tail = remapOne(col1, row1);
-      return `${sheetPrefix || ''}${colAbs0}${head.nextCol}${rowAbs0}${
-        head.nextRow
-      }:${colAbs1}${tail.nextCol}${rowAbs1}${tail.nextRow}`;
+      return `${sheetPrefix || ''}${colAbs0}${head.nextCol}${rowAbs0}${head.nextRow
+        }:${colAbs1}${tail.nextCol}${rowAbs1}${tail.nextRow}`;
     },
   );
 }
@@ -5710,9 +6629,8 @@ function formatRefToken(parts: {
   col: number;
   row: number;
 }) {
-  return `${parts.colAbs ? '$' : ''}${indexToColumnChar(parts.col)}${
-    parts.rowAbs ? '$' : ''
-  }${parts.row + 1}`;
+  return `${parts.colAbs ? '$' : ''}${indexToColumnChar(parts.col)}${parts.rowAbs ? '$' : ''
+    }${parts.row + 1}`;
 }
 
 function moveSingleRefToken(

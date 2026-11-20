@@ -34,6 +34,9 @@ import {
   markRangeSelectionDirty,
   rangeHightlightselected,
   setFormulaEditorOwner,
+  ensureFormulaRangeToSheet,
+  returnToFormulaOriginSheet,
+  getRangetxt,
   normalizeSelection,
   snapSheetSelectionFocusToCellPreserveMultiRange,
   captureLinkEditorOpenSnapshot,
@@ -43,6 +46,7 @@ import {
   applyLinkToSelection,
   getCellHyperlink,
 } from '@sheet-engine/core';
+import type { Context, GlobalCache } from '@sheet-engine/core';
 import React, {
   useContext,
   useEffect,
@@ -62,6 +66,7 @@ import CellDatePicker from './CellDatePicker';
 import usePrevious from '../../hooks/usePrevious';
 import { useFormulaEditorHistory } from '../../hooks/useFormulaEditorHistory';
 import { useRerenderOnFormulaCaret } from '../../hooks/useRerenderOnFormulaCaret';
+import { useLastFormulaCaretOffset } from '../../hooks/useLastFormulaCaretOffset';
 import {
   moveCursorToEnd,
   getCursorPosition,
@@ -75,6 +80,7 @@ import {
   isFormulaCompleteAtCaret,
   isEditorUndoRedoKeyEvent,
 } from './helper';
+import { matchUndoRedoShortcut } from '@sheet-engine/core/events/keyboard-shortcut-utils';
 import { isFormulaSegmentBoundaryKey } from './formula-segment-boundary';
 import { LucideIcon } from './LucideIcon';
 
@@ -306,6 +312,171 @@ function setSelectionByCharacterOffsetInEditor(
   return true;
 }
 
+type EditSelectionLike = {
+  row?: number[];
+  column?: number[];
+  row_focus?: number;
+  column_focus?: number;
+  width?: number;
+  height?: number;
+};
+
+function focusColWidthFromVisible(
+  visibledatacolumn: number[],
+  focusCol: number,
+): number {
+  const col_f = visibledatacolumn[focusCol];
+  const col_pre = focusCol <= 0 ? 0 : visibledatacolumn[focusCol - 1];
+  if (col_f == null) return 0;
+  return Math.max(0, col_f - col_pre - 1);
+}
+
+function focusColWidthFromLiveRight(
+  visibledatacolumn: number[],
+  focusCol: number,
+  liveRightPx: number,
+): number {
+  const col_pre = focusCol <= 0 ? 0 : visibledatacolumn[focusCol - 1];
+  return Math.max(0, liveRightPx - col_pre - 1);
+}
+
+function focusRowHeightFromLiveBottom(
+  visibledatarow: number[],
+  focusRow: number,
+  liveBottomPx: number,
+): number {
+  const row_pre = focusRow <= 0 ? 0 : visibledatarow[focusRow - 1];
+  return Math.max(0, liveBottomPx - row_pre - 1);
+}
+
+/** Width/height for the in-cell editor; tracks layout and live column resize without cloning selection. */
+function useEditCellBoxDimensions(
+  context: Context,
+  firstSelection: EditSelectionLike | undefined,
+  globalCache: GlobalCache,
+): { width: number; height: number } | null {
+  const editing = (context.luckysheetCellUpdate?.length ?? 0) > 0;
+  const focusCol = firstSelection?.column_focus ?? firstSelection?.column?.[0];
+  const focusRow = firstSelection?.row_focus ?? firstSelection?.row?.[0];
+
+  const layoutWidth = useMemo(() => {
+    if (!editing || typeof focusCol !== 'number') return null;
+    return focusColWidthFromVisible(context.visibledatacolumn, focusCol);
+  }, [editing, focusCol, context.visibledatacolumn]);
+
+  const layoutHeight = useMemo(() => {
+    if (!editing || typeof focusRow !== 'number') return null;
+    const row_f = context.visibledatarow[focusRow];
+    const row_pre = focusRow <= 0 ? 0 : context.visibledatarow[focusRow - 1];
+    if (row_f == null) return firstSelection?.height ?? 0;
+    return Math.max(0, row_f - row_pre - 1);
+  }, [editing, focusRow, context.visibledatarow, firstSelection?.height]);
+
+  const resizingCol = context.luckysheet_cols_change_size_start?.[1];
+  const colResizeActive =
+    editing &&
+    !!context.luckysheet_cols_change_size &&
+    typeof resizingCol === 'number' &&
+    typeof focusCol === 'number' &&
+    resizingCol === focusCol;
+
+  const [liveWidth, setLiveWidth] = useState<number | null>(null);
+  const visColsRef = useRef(context.visibledatacolumn);
+  visColsRef.current = context.visibledatacolumn;
+
+  useEffect(() => {
+    if (!colResizeActive) {
+      setLiveWidth(null);
+      return;
+    }
+    let raf = 0;
+    let last = -1;
+    const tick = () => {
+      const liveRight = globalCache.colResizeLiveRightPx;
+      if (typeof liveRight === 'number' && typeof focusCol === 'number') {
+        const w = focusColWidthFromLiveRight(
+          visColsRef.current,
+          focusCol,
+          liveRight,
+        );
+        if (w !== last) {
+          last = w;
+          setLiveWidth(w);
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      setLiveWidth(null);
+    };
+  }, [colResizeActive, focusCol, globalCache]);
+
+  const resizingRow = context.luckysheet_rows_change_size_start?.[1];
+  const rowResizeActive =
+    editing &&
+    !!context.luckysheet_rows_change_size &&
+    typeof resizingRow === 'number' &&
+    typeof focusRow === 'number' &&
+    resizingRow === focusRow;
+
+  const [liveHeight, setLiveHeight] = useState<number | null>(null);
+  const visRowsRef = useRef(context.visibledatarow);
+  visRowsRef.current = context.visibledatarow;
+
+  useEffect(() => {
+    if (!rowResizeActive) {
+      setLiveHeight(null);
+      return;
+    }
+    let raf = 0;
+    let last = -1;
+    const tick = () => {
+      const liveBottom = globalCache.rowResizeLiveBottomPx;
+      if (typeof liveBottom === 'number' && typeof focusRow === 'number') {
+        const h = focusRowHeightFromLiveBottom(
+          visRowsRef.current,
+          focusRow,
+          liveBottom,
+        );
+        if (h !== last) {
+          last = h;
+          setLiveHeight(h);
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      setLiveHeight(null);
+    };
+  }, [rowResizeActive, focusRow, globalCache]);
+
+  return useMemo(() => {
+    if (!editing || !firstSelection) return null;
+    const width =
+      colResizeActive && liveWidth != null
+        ? liveWidth
+        : (layoutWidth ?? firstSelection.width ?? 0);
+    const height =
+      rowResizeActive && liveHeight != null
+        ? liveHeight
+        : (layoutHeight ?? firstSelection.height ?? 0);
+    return { width, height };
+  }, [
+    editing,
+    firstSelection,
+    colResizeActive,
+    liveWidth,
+    layoutWidth,
+    rowResizeActive,
+    liveHeight,
+    layoutHeight,
+  ]);
+}
+
 const InputBox: React.FC = () => {
   const { context, setContext, refs } = useContext(WorkbookContext);
   const inputRef = useRef<HTMLDivElement | null>(null);
@@ -343,9 +514,17 @@ const InputBox: React.FC = () => {
   const [cellEditorExtendRight, setCellEditorExtendRight] = useState(false);
   const row_index = firstSelection?.row_focus!;
   const col_index = firstSelection?.column_focus!;
+  const editCellBoxSize = useEditCellBoxDimensions(
+    context,
+    firstSelection,
+    refs.globalCache,
+  );
   const formulaSearchActiveCellKey =
-    !_.isEmpty(context.luckysheetCellUpdate) && firstSelection
-      ? `${context.currentSheetId}:${firstSelection.row_focus}:${firstSelection.column_focus}`
+    !_.isEmpty(context.luckysheetCellUpdate) &&
+    context.luckysheetCellUpdate.length === 2
+      ? `${
+          context.formulaCache.rangetosheet || context.currentSheetId
+        }:${context.luckysheetCellUpdate[0]}:${context.luckysheetCellUpdate[1]}`
       : null;
   const lockedFormulaSearchTop =
     formulaSearchActiveCellKey &&
@@ -517,7 +696,6 @@ const InputBox: React.FC = () => {
     }
     if (firstSelection && context.luckysheetCellUpdate.length > 0) {
       if (refs.globalCache.doNotUpdateCell) {
-        delete refs.globalCache.doNotUpdateCell;
         return;
       }
       // Same cell as last applied layout pass: never re-hydrate from sheet or move
@@ -525,6 +703,15 @@ const InputBox: React.FC = () => {
       if (
         _.isEqual(prevCellUpdate, context.luckysheetCellUpdate) &&
         prevSheetId === context.currentSheetId
+      ) {
+        return;
+      }
+
+      // Cross-sheet formula pick: keep the in-progress editor DOM when the sheet
+      // changes; never re-hydrate from the foreign (or restored origin) sheet cell.
+      if (
+        prevSheetId !== context.currentSheetId &&
+        context.luckysheetCellUpdate.length > 0
       ) {
         return;
       }
@@ -683,6 +870,10 @@ const InputBox: React.FC = () => {
       resetFormulaHistory();
     }
   }, [context.luckysheetCellUpdate, resetFormulaHistory, refs.globalCache]);
+
+  useEffect(() => {
+    delete refs.globalCache.doNotUpdateCell;
+  }, [context.luckysheetCellUpdate, refs.globalCache]);
 
   // Keep link insert offsets accurate when toolbar/modals steal focus: refresh snapshot on caret moves.
   const contextRefForLinkSnapshot = useRef(context);
@@ -843,16 +1034,82 @@ const InputBox: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [context.luckysheet_select_save]);
 
-  // Reset active state when selection changes or InputBox is hidden
+  // Reset active state when edit ends or a blocking dialog opens.
+  // Do not tear down an in-progress formula session just because the foreign
+  // sheet has no selection yet after a tab switch.
   useEffect(() => {
     if (
-      !firstSelection ||
       context.rangeDialog?.show ||
       _.isEmpty(context.luckysheetCellUpdate)
     ) {
       setIsInputBoxActive(false);
     }
-  }, [firstSelection, context.rangeDialog?.show, context.luckysheetCellUpdate]);
+  }, [context.rangeDialog?.show, context.luckysheetCellUpdate]);
+
+  const lastCellCaretOffsetRef = useLastFormulaCaretOffset(
+    refs.cellInput,
+    context.luckysheetCellUpdate.length > 0,
+  );
+
+  // After keeping formula edit open across a sheet switch, restore focus/caret so
+  // bare `=` keyboard ref picking continues (tabs steal focus from contenteditable).
+  useEffect(() => {
+    if (!context.formulaCache.refocusFormulaEditorAfterSheetSwitch) return;
+    if (context.luckysheetCellUpdate.length === 0) return;
+    if (getFormulaEditorOwner(context) === 'fx') return;
+
+    const editor = refs.cellInput.current;
+    if (!editor) return;
+
+    setContext((ctx) => {
+      ctx.formulaCache.refocusFormulaEditorAfterSheetSwitch = false;
+    });
+
+    requestAnimationFrame(() => {
+      editor.focus({ preventScroll: true });
+      // Put the caret back where the user left it (e.g. after the `,` in
+      // `=SUM('Sheet - 2'!B2,`). Only fall back to "after the first ref" when
+      // we never saw a caret in the editor.
+      const savedOffset = lastCellCaretOffsetRef.current;
+      if (savedOffset != null) {
+        setCursorPosition(
+          editor,
+          Math.min(savedOffset, editor.textContent?.length ?? 0),
+        );
+        return;
+      }
+      const managed = editor.querySelector(
+        'span.fortune-formula-functionrange-cell',
+      ) as HTMLElement | null;
+      if (managed) {
+        const sel = window.getSelection();
+        const textNode =
+          managed.firstChild && managed.firstChild.nodeType === Node.TEXT_NODE
+            ? managed.firstChild
+            : null;
+        if (sel && textNode) {
+          const range = document.createRange();
+          range.setStart(
+            textNode,
+            textNode.textContent?.length ?? 0,
+          );
+          range.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          return;
+        }
+      }
+      moveCursorToEnd(editor);
+    });
+  }, [
+    context.formulaCache.refocusFormulaEditorAfterSheetSwitch,
+    context.currentSheetId,
+    context.luckysheetCellUpdate.length,
+    context,
+    refs.cellInput,
+    setContext,
+    lastCellCaretOffsetRef,
+  ]);
 
   // Cleanup: if input box is no longer active, remove any lingering
   // blue dotted formula-range overlays from the canvas.
@@ -876,6 +1133,7 @@ const InputBox: React.FC = () => {
       ctx.formulaCache.rangedrag_row_start = false;
       ctx.formulaCache.rangechangeindex = undefined;
       ctx.formulaCache.rangeSelectionActive = null;
+      ctx.formulaCache.formulaKeyboardRefSync = false;
     });
   }, [isInputBoxActive, setContext]);
 
@@ -1058,12 +1316,15 @@ const InputBox: React.FC = () => {
           !!ctx.formulaCache.rangestart ||
           !!ctx.formulaCache.rangedrag_column_start ||
           !!ctx.formulaCache.rangedrag_row_start);
-      const refRange = preferFuncRange
-        ? { row: fsr!.row, column: fsr!.column }
-        : {
-            row: currentSelection.row,
-            column: currentSelection.column,
-          };
+
+      // Intentional pick only. Idle selection changes (type-over race, sheet-tab
+      // restore of another sheet's A1, etc.) must not insert a ref — otherwise
+      // `=SUM(` + switch to Sheet2 becomes `=SUM(Sheet2!A1` with no nav/drag.
+      if (!preferFuncRange) {
+        return;
+      }
+
+      const refRange = { row: fsr!.row, column: fsr!.column };
 
       // Point rangechangeindex at the ref under/near the caret — not always the
       // last span (e.g. `=,A4` with caret between `=` and `,` must not replace A4).
@@ -1298,14 +1559,24 @@ const InputBox: React.FC = () => {
         formulaAnchorCellRef.current == null
       ) {
         // Starting a new formula flow; clear range-selection dirtiness so
-        // the user can start referencing again.
+        // the user can start referencing again. Also drop any stale keyboard
+        // ref-sync state so a re-fired selection effect cannot insert the
+        // edit cell (e.g. `=` → `=A1`).
+        const [anchorRow, anchorCol] = context.luckysheetCellUpdate;
         setContext((draftCtx) => {
+          ensureFormulaRangeToSheet(draftCtx);
           draftCtx.formulaCache.rangeSelectionActive = null;
+          draftCtx.formulaCache.formulaKeyboardRefSync = false;
+          draftCtx.formulaCache.func_selectedrange = undefined;
+          draftCtx.formulaCache.rangestart = false;
+          draftCtx.formulaCache.rangedrag_column_start = false;
+          draftCtx.formulaCache.rangedrag_row_start = false;
+          draftCtx.formulaRangeSelect = undefined;
         });
-        formulaAnchorCellRef.current = [
-          context.luckysheetCellUpdate[0],
-          context.luckysheetCellUpdate[1],
-        ];
+        formulaAnchorCellRef.current = [anchorRow, anchorCol];
+        if (e.key === '=') {
+          suppressAnchorSelectionSyncRef.current = [anchorRow, anchorCol];
+        }
       }
 
       if (e.key === '(' && currentInputIsFormula) {
@@ -1327,15 +1598,22 @@ const InputBox: React.FC = () => {
           draftCtx.formulaCache.rangeSelectionActive = null;
         });
         const [anchorRow, anchorCol] = formulaAnchorCellRef.current;
+        const onForeignSheet =
+          !!context.formulaCache.rangetosheet &&
+          context.formulaCache.rangetosheet !== context.currentSheetId;
         suppressAnchorSelectionSyncRef.current = [anchorRow, anchorCol];
         setTimeout(() => {
           setContext((draftCtx) => {
             draftCtx.luckysheetCellUpdate = [anchorRow, anchorCol];
-            snapSheetSelectionFocusToCellPreserveMultiRange(
-              draftCtx,
-              anchorRow,
-              anchorCol,
-            );
+            // On a foreign sheet, keep the pick selection — do not snap yellow to
+            // the origin cell's row/col (that would select the wrong sheet's cell).
+            if (!onForeignSheet) {
+              snapSheetSelectionFocusToCellPreserveMultiRange(
+                draftCtx,
+                anchorRow,
+                anchorCol,
+              );
+            }
             // Reference before delimiter is complete; clear the active range-select
             // overlay, but keep completed referenced-cell highlights visible.
             // Clear keyboard-ref sync so the rangeSetValue effect does not take the
@@ -1355,7 +1633,9 @@ const InputBox: React.FC = () => {
                 refs.fxInput.current?.innerHTML ||
                 '',
             );
-            moveHighlightCell(draftCtx, 'down', 0, 'rangeOfSelect');
+            if (!onForeignSheet) {
+              moveHighlightCell(draftCtx, 'down', 0, 'rangeOfSelect');
+            }
           });
         }, 0);
       }
@@ -1368,8 +1648,9 @@ const InputBox: React.FC = () => {
       // }
 
       if ((e.metaKey || e.ctrlKey) && context.luckysheetCellUpdate.length > 0) {
-        if (e.code === 'KeyZ' || e.code === 'KeyY') {
-          const isRedo = e.code === 'KeyY' || (e.code === 'KeyZ' && e.shiftKey);
+        const undoRedo = matchUndoRedoShortcut(e as unknown as KeyboardEvent);
+        if (undoRedo) {
+          const isRedo = undoRedo === 'redo';
 
           // Always intercept undo/redo in-editor to prevent native
           // contenteditable history from fighting our snapshot stack.
@@ -1477,20 +1758,27 @@ const InputBox: React.FC = () => {
         const anchor = formulaAnchorCellRef.current;
         if (anchor != null) {
           const [anchorRow, anchorCol] = anchor;
+          const onForeignSheet =
+            !!context.formulaCache.rangetosheet &&
+            context.formulaCache.rangetosheet !== context.currentSheetId;
           suppressAnchorSelectionSyncRef.current = [anchorRow, anchorCol];
           setTimeout(() => {
             setContext((draftCtx) => {
               draftCtx.luckysheetCellUpdate = [anchorRow, anchorCol];
-              snapSheetSelectionFocusToCellPreserveMultiRange(
-                draftCtx,
-                anchorRow,
-                anchorCol,
-              );
+              if (!onForeignSheet) {
+                snapSheetSelectionFocusToCellPreserveMultiRange(
+                  draftCtx,
+                  anchorRow,
+                  anchorCol,
+                );
+              }
               // Same as segment boundary: avoid rangeSetValue effect inserting the
               // anchor (e.g. `=A2` → delete `2` → `=A1`) when selection snaps to anchor.
               draftCtx.formulaCache.formulaKeyboardRefSync = false;
-              // Recompute selection box immediately so UI snaps back to anchor cell.
-              moveHighlightCell(draftCtx, 'down', 0, 'rangeOfSelect');
+              if (!onForeignSheet) {
+                // Recompute selection box immediately so UI snaps back to anchor cell.
+                moveHighlightCell(draftCtx, 'down', 0, 'rangeOfSelect');
+              }
               markRangeSelectionDirty(draftCtx);
               // markRangeSelectionDirty clears formulaRangeHighlight; rebuild from the
               // live editor so argument highlights return after handleFormulaInput ran.
@@ -1527,14 +1815,15 @@ const InputBox: React.FC = () => {
 
       if (e.key === 'Escape' && context.luckysheetCellUpdate.length > 0) {
         setContext((draftCtx) => {
+          returnToFormulaOriginSheet(draftCtx);
           cancelNormalSelected(draftCtx);
           moveHighlightCell(draftCtx, 'down', 0, 'rangeOfSelect');
         });
         e.preventDefault();
       } else if (e.key === 'Enter' && context.luckysheetCellUpdate.length > 0) {
-        if (e.altKey || e.metaKey) {
-          // Fully own Cmd/Alt+Enter behavior to avoid native contenteditable
-          // insertion running in parallel with our custom newline path.
+        if (e.altKey) {
+          // In-cell line break: Alt+Enter (Win) / Ctrl+Option+Return (Mac).
+          // Cmd/Ctrl+Enter (fill range) must bubble to the workbook handler.
           e.preventDefault();
           // Match Space behavior in multiline mode too: link the token before caret first.
           autoLinkUrlsInEditorRef.current('commit', {
@@ -1553,6 +1842,9 @@ const InputBox: React.FC = () => {
             document.execCommand('delete', false);
           }
           e.stopPropagation();
+        } else if ((e.ctrlKey || e.metaKey) && !e.shiftKey) {
+          // Fill range (Ctrl/Cmd+Enter): let handleShortcutsV2 handle it.
+          return;
         } else {
           // Single-line Enter commit should also auto-link like Space.
           autoLinkUrlsInEditorRef.current('commit');
@@ -2214,39 +2506,66 @@ const InputBox: React.FC = () => {
 
   // Calculate cell address indicator position
   const getAddressIndicatorPosition = useCallback(() => {
-    if (!firstSelection || context.rangeDialog?.show) {
+    if (context.rangeDialog?.show) {
       return { display: 'none' };
     }
 
     // Always show above the input box
     return { top: '-18px', left: '0', display: 'block' };
-  }, [firstSelection, context.rangeDialog?.show]);
+  }, [context.rangeDialog?.show]);
 
-  // Generate cell address string (e.g., "A1", "B5")
-  const getCellAddress = useCallback(() => {
-    if (!firstSelection) return '';
+  // Generate cell address string for the cell being edited (origin sheet).
+  const getEditCellAddress = useCallback(() => {
+    if (context.luckysheetCellUpdate.length !== 2) {
+      if (!firstSelection) return '';
+      const rowIndex = firstSelection.row_focus || 0;
+      const colIndex = firstSelection.column_focus || 0;
+      return `${indexToColumnChar(colIndex)}${rowIndex + 1}`;
+    }
+    const [rowIndex, colIndex] = context.luckysheetCellUpdate;
+    const local = `${indexToColumnChar(colIndex)}${rowIndex + 1}`;
+    const origin = context.formulaCache.rangetosheet;
+    if (origin && origin !== context.currentSheetId) {
+      return (
+        getRangetxt(
+          context,
+          origin,
+          { row: [rowIndex, rowIndex], column: [colIndex, colIndex] },
+          context.currentSheetId,
+        ) || local
+      );
+    }
+    return local;
+  }, [
+    context,
+    context.luckysheetCellUpdate,
+    context.formulaCache.rangetosheet,
+    context.currentSheetId,
+    firstSelection,
+  ]);
 
-    const rowIndex = firstSelection.row_focus || 0;
-    const colIndex = firstSelection.column_focus || 0;
-
-    const columnChar = indexToColumnChar(colIndex);
-    const rowNumber = rowIndex + 1;
-
-    return `${columnChar}${rowNumber}`;
-  }, [firstSelection]);
+  const showCrossSheetAddressIndicator =
+    !!context.formulaCache.rangetosheet &&
+    context.formulaCache.rangetosheet !== context.currentSheetId &&
+    context.luckysheetCellUpdate.length > 0;
 
   useEffect(() => {
     if (isInputBoxActive) {
-      setActiveCell(getCellAddress());
+      setActiveCell(getEditCellAddress());
       setFirstSelectionActiveCell(context.luckysheet_select_save?.[0]);
     }
-  }, [isInputBoxActive]);
+  }, [isInputBoxActive, getEditCellAddress]);
 
   useLayoutEffect(() => {
     const editing = context.luckysheetCellUpdate.length > 0;
     if (!editing) {
       scrollAtEditSessionStartRef.current = null;
       setShowAddressIndicator(false);
+      return;
+    }
+
+    if (showCrossSheetAddressIndicator) {
+      setShowAddressIndicator(true);
       return;
     }
 
@@ -2271,6 +2590,7 @@ const InputBox: React.FC = () => {
     context.scrollLeft,
     context.scrollTop,
     prevCellUpdate,
+    showCrossSheetAddressIndicator,
   ]);
 
   useEffect(() => {
@@ -2405,11 +2725,7 @@ const InputBox: React.FC = () => {
       setCellEditorExtendRight(false);
       return;
     }
-    const baseSel =
-      isInputBoxActive && firstSelectionActiveCell
-        ? firstSelectionActiveCell
-        : firstSelection;
-    const cellW = baseSel?.width;
+    const cellW = editCellBoxSize?.width;
     if (cellW == null || !inputRef.current) {
       setCellEditorExtendRight(false);
       return;
@@ -2419,16 +2735,19 @@ const InputBox: React.FC = () => {
   }, [
     editorLayoutTick,
     context.luckysheetCellUpdate.length,
-    isInputBoxActive,
-    firstSelectionActiveCell,
-    firstSelection,
+    editCellBoxSize?.width,
     context.zoomRatio,
   ]);
 
   const wraperGetCell = () => {
-    const cell = getCellAddress();
+    const cell = getEditCellAddress();
     if (activeRefCell !== cell) {
       setActiveRefCell(cell);
+    }
+    // Prefer live address when picking on another sheet so the badge shows
+    // `SheetName!A1` instead of the frozen same-sheet label from edit start.
+    if (showCrossSheetAddressIndicator) {
+      return cell;
     }
     return activeCell || cell;
   };
@@ -2517,11 +2836,6 @@ const InputBox: React.FC = () => {
     context,
   ]);
 
-  const inputBoxBaseSelection =
-    isInputBoxActive && firstSelectionActiveCell
-      ? firstSelectionActiveCell
-      : firstSelection;
-
   return (
     <div
       className="luckysheet-input-box"
@@ -2536,7 +2850,7 @@ const InputBox: React.FC = () => {
       }}
       onMouseUp={(e) => e.stopPropagation()}
     >
-      {firstSelection && !context.rangeDialog?.show && showAddressIndicator && (
+      {(!context.rangeDialog?.show && showAddressIndicator) && (
         <div
           className="luckysheet-cell-address-indicator"
           style={getAddressIndicatorPosition()}
@@ -2549,11 +2863,11 @@ const InputBox: React.FC = () => {
         className="luckysheet-input-box-inner"
         onMouseDown={onInputBoxInnerMouseDown}
         style={
-          inputBoxBaseSelection
+          editCellBoxSize
             ? {
                 position: 'relative',
-                minWidth: inputBoxBaseSelection.width,
-                minHeight: inputBoxBaseSelection.height,
+                minWidth: editCellBoxSize.width,
+                minHeight: editCellBoxSize.height,
                 ...inputBoxStyle,
                 ...(cellEditorExtendRight
                   ? { paddingRight: 2 + CELL_EDIT_INPUT_EXTRA_RIGHT_PX }

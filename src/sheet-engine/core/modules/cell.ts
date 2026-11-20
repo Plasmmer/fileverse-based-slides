@@ -8,7 +8,10 @@ import {
   processArray,
   getContentInParentheses,
   getNumberFormat,
+  formatSheetNameForFormula,
+  quoteSheetNamesInFormula,
 } from '../utils';
+import { ensureSheetFlowdata } from '../api/sheet';
 import { checkCF, getComputeMap } from './ConditionFormat';
 import { getFailureText, validateCellData } from './dataVerification';
 import {
@@ -28,6 +31,7 @@ import {
   getCanonicalDateEditFormat,
   getDateEditFormatForCell,
 } from './date-base-locale';
+import { punchRectHoleInCellFormatRanges } from '../utils/range-format';
 import { clearCellError } from '../api';
 import {
   delFunctionGroup,
@@ -38,7 +42,11 @@ import {
   isTodayNowPureArithmeticDateResult,
   iscelldata,
   suppressFormulaRangeSelectionForInitialEdit,
+  resetFormulaArrowSession,
+  ensureFormulaRangeToSheet,
+  returnToFormulaOriginSheet,
 } from './formula';
+import { isFormulaEvalPending } from './formula-async-eval';
 import {
   convertSpanToShareString,
   getHyperlinksFromInlineSegments,
@@ -616,12 +624,12 @@ export function setCellValue(
       if (cell.v === Infinity || cell.v === -Infinity) {
         cell.m = cell.v.toString();
       } else {
-        if (shouldUseScientificForComputedNumber(cell.v as number)) {
-          cell.m = formatScientificForComputedNumber(cell.v as number);
-        } else if (cell.v.toString().toLowerCase().indexOf('e') > -1) {
+        const v_p = Math.round((cell.v as number) * 1000000000) / 1000000000;
+        if (shouldUseScientificForComputedNumber(v_p)) {
+          cell.m = formatScientificForComputedNumber(v_p);
+        } else if ((cell.v as number).toString().toLowerCase().indexOf('e') > -1) {
           cell.m = formatMForNumericCellAvoidingGsRules(cell.v as number);
         } else {
-          const v_p = Math.round(cell.v * 1000000000) / 1000000000;
           if (_.isNil(cell.ct)) {
             const mask = genarate(v_p);
             if (mask != null) {
@@ -631,8 +639,6 @@ export function setCellValue(
             const mask = update(cell.ct.fa!, v_p);
             cell.m = mask.toString();
           }
-
-          // cell.m = mask[0].toString();
         }
       }
 
@@ -1247,6 +1253,11 @@ export function cancelNormalSelected(ctx: Context) {
   ctx.formulaCache.rangedrag_row_start = false;
   ctx.formulaCache.rangeSelectionActive = null;
   ctx.formulaCache.keyboardRangeSelectionLock = false;
+  resetFormulaArrowSession(ctx);
+  ctx.formulaCache.formulaKeyboardRefSync = false;
+  ctx.formulaCache.func_selectedrange = undefined;
+  ctx.formulaCache.rangetosheet = undefined;
+  ctx.formulaCache.refocusFormulaEditorAfterSheetSwitch = false;
   ctx.formulaCache.formulaEditorOwner = null;
 }
 
@@ -1285,6 +1296,12 @@ export function updateCell(
 ) {
   try {
     if (ctx.allowEdit === false || ctx.isFlvReadOnly) return;
+
+    // Cross-sheet formula pick: write back to the sheet where the edit started.
+    returnToFormulaOriginSheet(ctx);
+    // Origin may have been demoted while picking on another tab — hydrate first
+    // so we don't early-return on a null flowdata and leave a stale 0.
+    ensureSheetFlowdata(ctx);
 
     const rawInputText = $input?.innerText;
     const normalizedFormulaInputText = (rawInputText || '')
@@ -1344,10 +1361,6 @@ export function updateCell(
 
     const flowdata = getFlowdata(ctx);
     if (!flowdata) return;
-
-    // if (!_.isNil(rangetosheet) && rangetosheet !== ctx.currentSheetId) {
-    //   sheetmanage.changeSheetExec(rangetosheet);
-    // }
 
     // if (!checkProtectionLocked(r, c, ctx.currentSheetId)) {
     //   return;
@@ -1461,7 +1474,10 @@ export function updateCell(
     // API, we get value from user
     value = value || inputText;
     if (_.isString(value) && value.startsWith('=')) {
-      value = normalizeFormulaExecText(value);
+      value = quoteSheetNamesInFormula(
+        normalizeFormulaExecText(value),
+        ctx.luckysheetfile.map((f) => f.name),
+      );
     }
     if (_.isString(value) && value.startsWith('=') && value.length > 1) {
       const closedValue = closeUnclosedParenthesesInFormula(value);
@@ -1480,7 +1496,12 @@ export function updateCell(
       (value as Cell).f!.length > 1
     ) {
       const originalFormula = (value as Cell).f!;
-      const closedFormula = closeUnclosedParenthesesInFormula(originalFormula);
+      const closedFormula = closeUnclosedParenthesesInFormula(
+        quoteSheetNamesInFormula(
+          originalFormula,
+          ctx.luckysheetfile.map((f) => f.name),
+        ),
+      );
       if (
         shouldPersistFormulaEditHtml &&
         (rawInputText ?? '').startsWith('=') &&
@@ -1687,6 +1708,9 @@ export function updateCell(
           delete curv.f;
           delete curv._formulaEditHtml;
           delete curv.spl;
+          // Drop the previous display string so `setCellValue` recomputes `m`
+          // from the new `v` (otherwise a stale mask like "4" survives a 4->5 edit).
+          delete curv.m;
 
           // FLV crypto denomination --START--
           const decemialCount = oldValue?.m?.toString().includes('.')
@@ -1853,7 +1877,7 @@ export function updateCell(
         (parseFloat(value?.v as string) / oldValue?.baseCurrencyPrice).toFixed(
           decemialCount || 2,
         )
-      } ${coin}`;
+        } ${coin}`;
     }
 
     // FLV crypto denomination --END--
@@ -1878,15 +1902,21 @@ export function updateCell(
           cancelNormalSelected(ctx);
           if (ctx.hooks.afterUpdateCell) {
             const newValue = _.cloneDeep(d[r][c]);
+            // Genuine user-driven edit (typed/committed via updateCell) — flag it
+            // so RTC joiners persist + broadcast it. Remote applies use
+            // setCellValueInternal and never reach here.
+            ctx.hooks.onLocalCellEdit?.();
             setTimeout(() =>
               ctx.hooks.afterUpdateCell?.(r, c, oldValue, newValue),
             );
           }
-          ctx.formulaCache.execFunctionGlobalData = null;
+          if (!isFormulaEvalPending(ctx)) {
+            ctx.formulaCache.execFunctionGlobalData = null;
+          }
           return;
         }
       }
-    } catch (_e) {}
+    } catch (_e) { }
 
     // --- hyperlink support ---
     const hyperlinkKey = `${r}_${c}`;
@@ -1985,12 +2015,18 @@ export function updateCell(
     if (ctx.hooks.afterUpdateCell) {
       const newValue = _.cloneDeep(flowdata[r][c]);
       const { afterUpdateCell } = ctx.hooks;
+      // Genuine user-driven edit (typed/committed via updateCell) — flag it so
+      // RTC joiners persist + broadcast it. Remote applies use
+      // setCellValueInternal and never reach here.
+      ctx.hooks.onLocalCellEdit?.();
       setTimeout(() => {
         afterUpdateCell?.(r, c, oldValue, newValue);
       });
     }
 
-    ctx.formulaCache.execFunctionGlobalData = null;
+    if (!isFormulaEvalPending(ctx)) {
+      ctx.formulaCache.execFunctionGlobalData = null;
+    }
   } catch (e) {
     console.error(e);
     cancelNormalSelected(ctx);
@@ -2079,21 +2115,11 @@ export function getRangetxt(
   }
 
   if (sheetId !== currentId) {
-    // sheet名字包含'的，引用时应该替换为''
+    // Quote names that are not plain identifiers (spaces, `-`, etc.) so the
+    // reference parses, e.g. `'Finance - 1'!A1`, `'Sheet-4'!H6`.
     const index = getSheetIndex(ctx, sheetId);
     if (index == null) return '';
-    sheettxt = ctx.luckysheetfile[index].name.replace(/'/g, "''");
-    // 如果包含除a-z、A-Z、0-9、下划线等以外的字符那么就用单引号包起来
-    if (
-      // eslint-disable-next-line no-misleading-character-class
-      /^[:A-Z_a-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02FF\u0370-\u037D\u037F-\u1FFF\u200C-\u200D\u2070-\u218F\u2C00-\u2FEF\u3001-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD][:A-Z_a-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02FF\u0370-\u037D\u037F-\u1FFF\u200C-\u200D\u2070-\u218F\u2C00-\u2FEF\u3001-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD\-.0-9\u00B7\u0300-\u036F\u203F-\u2040]*$/.test(
-        sheettxt,
-      )
-    ) {
-      sheettxt += '!';
-    } else {
-      sheettxt = `'${sheettxt}'!`;
-    }
+    sheettxt = `${formatSheetNameForFormula(ctx.luckysheetfile[index].name)}!`;
   }
 
   const row0 = range.row[0];
@@ -2114,9 +2140,8 @@ export function getRangetxt(
     return sheettxt + indexToColumnChar(column0) + (row0 + 1);
   }
 
-  return `${
-    sheettxt + indexToColumnChar(column0) + (row0 + 1)
-  }:${indexToColumnChar(column1)}${row1 + 1}`;
+  return `${sheettxt + indexToColumnChar(column0) + (row0 + 1)
+    }:${indexToColumnChar(column1)}${row1 + 1}`;
 }
 
 // 把string A1:A2转为选区数组
@@ -2606,12 +2631,12 @@ export function getInlineStringHTML(
         const dataAttrs =
           !options?.useSemanticMarkup && link?.linkType && link?.linkAddress
             ? ` data-link-type='${String(link.linkType).replace(
-                /'/g,
-                '&#39;',
-              )}' data-link-address='${String(link.linkAddress).replace(
-                /'/g,
-                '&#39;',
-              )}'${isPlainLinkDecor ? " data-link-plain='1'" : ''}`
+              /'/g,
+              '&#39;',
+            )}' data-link-address='${String(link.linkAddress).replace(
+              /'/g,
+              '&#39;',
+            )}'${isPlainLinkDecor ? " data-link-plain='1'" : ''}`
             : '';
         if (options?.isRichTextCopy) {
           if (options?.useSemanticMarkup) {
@@ -2812,7 +2837,8 @@ export function getdatabyselection(
   let d;
   let cfg;
   if (sheetId != null && sheetId !== ctx.currentSheetId) {
-    d = ctx.luckysheetfile[getSheetIndex(ctx, sheetId)!].data;
+    // Cross-sheet copy/paste: source tab may be demoted — rehydrate dense grid.
+    d = ensureSheetFlowdata(ctx, { id: sheetId });
     cfg = ctx.luckysheetfile[getSheetIndex(ctx, sheetId)!].config;
   } else {
     d = getFlowdata(ctx);
@@ -2850,7 +2876,10 @@ export function luckysheetUpdateCell(
   const flowdata = getFlowdata(ctx);
   const cell = flowdata?.[row_index]?.[col_index] as { f?: string } | null;
   if (cell?.f != null && String(cell.f).trim() !== '') {
-    suppressFormulaRangeSelectionForInitialEdit(ctx);
+    suppressFormulaRangeSelectionForInitialEdit(ctx, [row_index, col_index]);
+    ensureFormulaRangeToSheet(ctx);
+  } else {
+    resetFormulaArrowSession(ctx);
   }
   ctx.luckysheetCellUpdate = [row_index, col_index];
 }
@@ -2892,31 +2921,31 @@ function keepOnlyValueParts(cell: Cell | null | undefined): Cell | null {
 
   const sanitizedInlineCt = keepInlineStringContent
     ? {
-        ...(ct as { fa?: string; t?: string; tb?: string }),
-        s: ((ct as { s?: Array<Record<string, unknown>> }).s || []).map(
-          (seg) => {
-            const cleaned: Record<string, unknown> = {
-              v: String(seg?.v ?? ''),
+      ...(ct as { fa?: string; t?: string; tb?: string }),
+      s: ((ct as { s?: Array<Record<string, unknown>> }).s || []).map(
+        (seg) => {
+          const cleaned: Record<string, unknown> = {
+            v: String(seg?.v ?? ''),
+          };
+          // Keep hyperlink metadata as content.
+          // For hyperlink runs, preserve link decoration (fc/un) so clear-format
+          // does not remove visible link style (blue + underline).
+          const link = seg?.link as
+            | { linkType?: string; linkAddress?: string }
+            | undefined;
+          if (link?.linkType && link?.linkAddress) {
+            cleaned.link = {
+              linkType: link.linkType,
+              linkAddress: link.linkAddress,
             };
-            // Keep hyperlink metadata as content.
-            // For hyperlink runs, preserve link decoration (fc/un) so clear-format
-            // does not remove visible link style (blue + underline).
-            const link = seg?.link as
-              | { linkType?: string; linkAddress?: string }
-              | undefined;
-            if (link?.linkType && link?.linkAddress) {
-              cleaned.link = {
-                linkType: link.linkType,
-                linkAddress: link.linkAddress,
-              };
-              // Keep default hyperlink decoration after clear format.
-              cleaned.fc = 'rgb(0, 0, 255)';
-              cleaned.un = 1;
-            }
-            return cleaned;
-          },
-        ),
-      }
+            // Keep default hyperlink decoration after clear format.
+            cleaned.fc = 'rgb(0, 0, 255)';
+            cleaned.un = 1;
+          }
+          return cleaned;
+        },
+      ),
+    }
     : undefined;
 
   if (
@@ -2987,8 +3016,31 @@ export function clearSelectedCellFormat(ctx: Context) {
     }
   });
 
-  if (ctx?.hooks?.updateCellYdoc && changeMap.size > 0) {
-    ctx.hooks.updateCellYdoc(Array.from(changeMap.values()));
+  if (ctx?.hooks?.updateCellYdoc) {
+    const changes = Array.from(changeMap.values());
+    activeSheetFile.config ||= {};
+    let nextRanges = activeSheetFile.config.cellFormatRanges;
+    selectedRanges.forEach(({ row: rowRange, column: columnRange }) => {
+      nextRanges = punchRectHoleInCellFormatRanges(
+        nextRanges,
+        rowRange[0],
+        rowRange[1],
+        columnRange[0],
+        columnRange[1],
+      );
+    });
+    if (!_.isEqual(activeSheetFile.config.cellFormatRanges, nextRanges)) {
+      activeSheetFile.config.cellFormatRanges = nextRanges;
+      changes.push({
+        sheetId: ctx.currentSheetId,
+        path: ['config', 'cellFormatRanges'],
+        value: nextRanges,
+        type: 'update',
+      });
+    }
+    if (changes.length > 0) {
+      ctx.hooks.updateCellYdoc(changes);
+    }
   }
 }
 
@@ -3030,7 +3082,28 @@ export function clearRowsCellsFormat(ctx: Context) {
   });
 
   if (ctx?.hooks?.updateCellYdoc && changeMap.size > 0) {
-    ctx.hooks.updateCellYdoc(Array.from(changeMap.values()));
+    const changes = Array.from(changeMap.values());
+    activeSheetFile.config ||= {};
+    let nextRanges = activeSheetFile.config.cellFormatRanges;
+    selectedRanges.forEach(({ row: rowRange }) => {
+      nextRanges = punchRectHoleInCellFormatRanges(
+        nextRanges,
+        rowRange[0],
+        rowRange[1],
+        0,
+        columnCount - 1,
+      );
+    });
+    if (!_.isEqual(activeSheetFile.config.cellFormatRanges, nextRanges)) {
+      activeSheetFile.config.cellFormatRanges = nextRanges;
+      changes.push({
+        sheetId: ctx.currentSheetId,
+        path: ['config', 'cellFormatRanges'],
+        value: nextRanges,
+        type: 'update',
+      });
+    }
+    ctx.hooks.updateCellYdoc(changes);
   }
 }
 
@@ -3076,6 +3149,27 @@ export function clearColumnsCellsFormat(ctx: Context) {
   });
 
   if (ctx?.hooks?.updateCellYdoc && changeMap.size > 0) {
-    ctx.hooks.updateCellYdoc(Array.from(changeMap.values()));
+    const changes = Array.from(changeMap.values());
+    activeSheetFile.config ||= {};
+    let nextRanges = activeSheetFile.config.cellFormatRanges;
+    selectedRanges.forEach(({ column: columnRange }) => {
+      nextRanges = punchRectHoleInCellFormatRanges(
+        nextRanges,
+        0,
+        rowCount - 1,
+        columnRange[0],
+        columnRange[1],
+      );
+    });
+    if (!_.isEqual(activeSheetFile.config.cellFormatRanges, nextRanges)) {
+      activeSheetFile.config.cellFormatRanges = nextRanges;
+      changes.push({
+        sheetId: ctx.currentSheetId,
+        path: ['config', 'cellFormatRanges'],
+        value: nextRanges,
+        type: 'update',
+      });
+    }
+    ctx.hooks.updateCellYdoc(changes);
   }
 }

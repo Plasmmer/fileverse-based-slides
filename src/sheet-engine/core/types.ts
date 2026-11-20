@@ -1,5 +1,6 @@
 import { Patch as ImmerPatch } from 'immer';
 import { PatchOptions } from './utils';
+import type { CellFormatRange } from './utils/range-format';
 
 export type Op = {
   op:
@@ -107,6 +108,7 @@ export type Presence = {
   username: string;
   userId?: string;
   color: string;
+  isEns?: boolean;
   selection: {
     r: number;
     c: number;
@@ -130,9 +132,31 @@ export type SheetConfig = {
   customHeight?: Record<string, number>;
   customWidth?: Record<string, number>;
   borderInfo?: any[]; // 边框
+  /** Range-level cell formatting for empty cells (toolbar bulk format). */
+  cellFormatRanges?: CellFormatRange[];
+  /** Background compaction revision (celldata + borderInfo); synced via Yjs. */
+  sheetCompactionRev?: number;
   authority?: any;
   rowReadOnly?: Record<number, number>;
   colReadOnly?: Record<number, number>;
+};
+
+/**
+ * Workbook-level named range (Google Sheets / Excel definedNames).
+ * Runtime list lives on Context; persisted in Yjs as `${dsheetId}:definedNames`.
+ */
+export type DefinedName = {
+  id: string;
+  name: string;
+  sheetId: string;
+  range: {
+    row: [number, number];
+    column: [number, number];
+  };
+  scope: 'workbook' | 'sheet';
+  /** When scope === 'sheet', which sheet owns the name. */
+  localSheetId?: string;
+  comment?: string;
 };
 
 export type Image = {
@@ -142,6 +166,8 @@ export type Image = {
   left: number;
   top: number;
   src: string;
+  originWidth?: number;
+  originHeight?: number;
 };
 
 export type ConditionRulesProps = {
@@ -219,6 +245,8 @@ export type Sheet = {
   luckysheet_conditionformat_save?: any[];
   luckysheet_alternateformat_save?: any[];
   dataVerification?: any;
+  /** Interned dataVerification entries; per-cell map may hold numeric refs into this list. */
+  dataVerificationDefs?: any[];
   conditionRules?: ConditionRulesProps;
   hyperlink?: Record<string, HyperlinkEntry | HyperlinkEntry[]>;
   dynamicArray_compute?: any;
@@ -411,6 +439,10 @@ export type GlobalCache = {
     scrollTop?: number;
     scrollLeft?: number;
   };
+  /** Live column right edge (px) while dragging column resize; not in Immer context. */
+  colResizeLiveRightPx?: number;
+  /** Live row bottom edge (px) while dragging row resize; not in Immer context. */
+  rowResizeLiveBottomPx?: number;
 };
 
 export type SingleRange = { row: number[]; column: number[] };

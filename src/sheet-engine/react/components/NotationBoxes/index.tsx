@@ -1,4 +1,4 @@
-import React, { useCallback, useContext, useEffect, useRef } from 'react';
+import React, { useContext, useEffect } from 'react';
 import {
   getFlowdata,
   onCommentBoxMoveStart,
@@ -31,47 +31,11 @@ const NotationBoxes: React.FC = () => {
     }
   }, [flowdata, setContext]);
 
-  const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const mouseOverCommentBoxRef = useRef<boolean>(false);
-  const focusInsideCommentBoxRef = useRef<boolean>(false);
-
-  const cancelDismiss = useCallback(() => {
-    if (dismissTimerRef.current) {
-      clearTimeout(dismissTimerRef.current);
-      dismissTimerRef.current = null;
-    }
-  }, []);
-
-  const scheduleDismiss = useCallback(() => {
-    if (mouseOverCommentBoxRef.current || focusInsideCommentBoxRef.current) {
-      return;
-    }
-    if (dismissTimerRef.current) {
-      clearTimeout(dismissTimerRef.current);
-    }
-    dismissTimerRef.current = setTimeout(() => {
-      dismissTimerRef.current = null;
-      setContext((draft) => {
-        draft.editingCommentBox = undefined;
-      });
-    }, 2000);
-  }, [setContext]);
-
-  useEffect(() => {
-    if (!context.editingCommentBox) {
-      cancelDismiss();
-      return;
-    }
-    scheduleDismiss();
-  }, [context.editingCommentBox, scheduleDismiss, cancelDismiss]);
-
-  useEffect(() => () => cancelDismiss(), [cancelDismiss]);
-
+  // Escape closes the pinned (editingCommentBox) popup.
   useEffect(() => {
     if (!context.editingCommentBox) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-      cancelDismiss();
       setContext((draft) => {
         draft.editingCommentBox = undefined;
       });
@@ -79,7 +43,7 @@ const NotationBoxes: React.FC = () => {
     };
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [context.editingCommentBox, setContext, cancelDismiss]);
+  }, [context.editingCommentBox, setContext]);
 
   const handleMouseDownEvent =
     (r: number, c: number, rc: string, commentId: string) =>
@@ -111,6 +75,7 @@ const NotationBoxes: React.FC = () => {
         if (!commentBox) return null;
         const { r, c, rc, left, top, size } = commentBox;
         const isEditing = context.editingCommentBox?.rc === rc;
+        const isHover = !isEditing && context.hoveredCommentBox?.rc === rc;
         const commentId = `comment-box-${rc}`;
         return (
           <div key={rc + index}>
@@ -135,131 +100,24 @@ const NotationBoxes: React.FC = () => {
                 top,
                 zIndex: isEditing ? 500 : 400,
                 boxShadow: '0 1px 1px #0000002e,0 4px 8px #0000001a',
+                borderRadius: '4px',
               }}
               onMouseDown={(e) => {
                 e.stopPropagation();
               }}
-              onMouseEnter={
-                isEditing
-                  ? () => {
-                      mouseOverCommentBoxRef.current = true;
-                      cancelDismiss();
-                    }
-                  : undefined
-              }
-              onMouseLeave={
-                isEditing
-                  ? () => {
-                      mouseOverCommentBoxRef.current = false;
-                      if (!focusInsideCommentBoxRef.current) {
-                        scheduleDismiss();
-                      }
-                    }
-                  : undefined
-              }
-              onFocus={
-                isEditing
-                  ? () => {
-                      focusInsideCommentBoxRef.current = true;
-                      cancelDismiss();
-                    }
-                  : undefined
-              }
-              onBlur={
-                isEditing
-                  ? (e) => {
-                      if (
-                        e.currentTarget.contains(e.relatedTarget as Node | null)
-                      ) {
-                        return;
-                      }
-                      focusInsideCommentBoxRef.current = false;
-                      if (!mouseOverCommentBoxRef.current) {
-                        scheduleDismiss();
-                      }
-                    }
-                  : undefined
-              }
             >
-              {/* <div className="luckysheet-postil-dialog-move">
-                {["t", "r", "b", "l"].map((v) => (
-                  <div
-                    key={v}
-                    className={`luckysheet-postil-dialog-move-item luckysheet-postil-dialog-move-item-${v}`}
-                    data-type={v}
-                  />
-                ))}
-              </div> */}
-              {/* {isEditing && (
-                <div className="luckysheet-postil-dialog-resize">
-                  {["lt", "mt", "lm", "rm", "rt", "lb", "mb", "rb"].map((v) => (
-                    <div
-                      key={v}
-                      className={`luckysheet-postil-dialog-resize-item luckysheet-postil-dialog-resize-item-${v}`}
-                      data-type={v}
-                      onMouseDown={(e) => {
-                        const { nativeEvent } = e;
-                        onCommentBoxResizeStart(
-                          context,
-                          refs.globalCache,
-                          nativeEvent,
-                          { r, c, rc },
-                          commentId,
-                          v
-                        );
-                        e.stopPropagation();
-                      }}
-                    />
-                  ))}
-                </div>
-              )} */}
               <div
                 style={{
                   width: '100%',
-                  height: '100%',
-                  overflow: 'hidden',
+                  overflow: 'visible',
                 }}
               >
                 {settings.getCommentCellUI?.(
                   r,
                   c,
                   handleMouseDownEvent(r, c, rc, commentId),
+                  isHover,
                 )}
-                {/* <ContentEditable
-                  id={`comment-editor-${rc}`}
-                  autoFocus={autoFocus}
-                  style={{
-                    width: "100%",
-                    height: "100%",
-                    lineHeight: "20px",
-                    boxSizing: "border-box",
-                    textAlign: "center",
-                    wordBreak: "break-all",
-                    outline: "none",
-                  }}
-                  allowEdit={context.allowEdit}
-                  spellCheck={false}
-                  data-r={r}
-                  data-c={c}
-                  onKeyDown={(e) => e.stopPropagation()}
-                  onFocus={(e) => {
-                    if (context.allowEdit === false) return;
-                    refs.globalCache.editingCommentBoxEle =
-                      e.target as HTMLDivElement;
-                  }}
-                  onMouseDown={(e) => {
-                    setContext((draftContext) => {
-                      if (flowdata) {
-                        setEditingComment(draftContext, flowdata, r, c);
-                      }
-                    });
-                    e.stopPropagation();
-                  }}
-                  onDoubleClick={(e) => {
-                    e.stopPropagation();
-                  }}
-                  initialContent={value}
-                /> */}
               </div>
             </div>
           </div>

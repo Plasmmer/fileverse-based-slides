@@ -13,6 +13,20 @@ import {
   type HyperlinkEntry,
 } from '@sheet-engine/core';
 import WorkbookContext from '../../../context';
+import {
+  emitCelldataRangeDiffToYdoc,
+  snapshotPersistedCelldataInRange,
+} from '../../../../core/utils/ydoc-celldata-changes';
+import {
+  rangesEqual,
+  remapCellFormatRanges,
+} from '../../../../core/utils/range-format';
+import { remapBorderInfo } from '../../../../core/utils/border-config-utils';
+import {
+  buildBlockMoveIndexMap,
+  getSheetCommentKeyPrefixes,
+  notifyCommentAnchorMove,
+} from '../../../../core/utils/comment-anchor-move';
 
 export const useRowDragAndDrop = (
   containerRef: RefObject<HTMLDivElement | null>,
@@ -170,7 +184,7 @@ export const useRowDragAndDrop = (
     el.style.width = '0px';
     el.style.left = '0px';
     el.style.top = '0px';
-    el.style.background = '#5F6368';
+    el.style.background = 'hsl(var(--color-text-secondary))';
     el.style.zIndex = '9999';
     el.style.pointerEvents = 'none';
     document.body.appendChild(el);
@@ -217,7 +231,7 @@ export const useRowDragAndDrop = (
     el.style.position = 'fixed';
     el.style.boxSizing = 'border-box';
     el.style.padding = '6px 8px';
-    el.style.background = 'rgba(95,99,104,0.18)';
+    el.style.background = 'hsl(var(--color-text-secondary) / 0.18)';
     el.style.zIndex = '20000';
     el.style.pointerEvents = 'none';
     el.style.display = 'flex';
@@ -406,6 +420,15 @@ export const useRowDragAndDrop = (
           selectedSourceRowRef.current = selectedSourceRow;
           selectedTargetRowRef.current = selectedTargetRow;
 
+          const numColsBeforeMove = rows[0]?.length ?? 0;
+          const ydocBeforePersisted = snapshotPersistedCelldataInRange(
+            rows,
+            affectedRowStart,
+            affectedRowEnd,
+            0,
+            Math.max(0, numColsBeforeMove - 1),
+          );
+
           // Move selected row block in one splice pair, preserving relative order.
           const movedRows = rows.splice(selectedStart, moveCount);
           rows.splice(targetIndex, 0, ...movedRows);
@@ -414,22 +437,57 @@ export const useRowDragAndDrop = (
           updateContextWithSheetData(draft, _sheet.data);
 
           const d = getFlowdata(draft);
-          const rowMap: Record<number, number> = (() => {
-            const order = Array.from({ length: rows.length }, (_, i) => i);
-            const sourceStart = selectedStart;
-            const count = moveCount;
-            if (count <= 0) return {};
-            const moved = order.splice(sourceStart, count);
-            let insertAt = targetIndex;
-            if (insertAt < 0) insertAt = 0;
-            if (insertAt > order.length) insertAt = order.length;
-            order.splice(insertAt, 0, ...moved);
-            const map: Record<number, number> = {};
-            order.forEach((oldIdx, newIdx) => {
-              map[oldIdx] = newIdx;
+          const rowMap = buildBlockMoveIndexMap(
+            rows.length,
+            selectedStart,
+            moveCount,
+            targetIndex,
+          );
+
+          const previousFormatRanges = _sheet.config?.cellFormatRanges;
+          const nextFormatRanges = remapCellFormatRanges(
+            previousFormatRanges,
+            'row',
+            rowMap,
+          );
+          const previousBorderInfo = _sheet.config?.borderInfo;
+          const nextBorderInfo = previousBorderInfo?.length
+            ? remapBorderInfo(previousBorderInfo, 'row', rowMap)
+            : previousBorderInfo;
+
+          const ydocConfigChanges: {
+            sheetId: string;
+            path: string[];
+            value: unknown;
+            type: 'update';
+          }[] = [];
+
+          if (!rangesEqual(previousFormatRanges, nextFormatRanges)) {
+            _sheet.config ||= {};
+            _sheet.config.cellFormatRanges = nextFormatRanges;
+            ydocConfigChanges.push({
+              sheetId: draft.currentSheetId,
+              path: ['config', 'cellFormatRanges'],
+              value: nextFormatRanges,
+              type: 'update',
             });
-            return map;
-          })();
+          }
+
+          if (previousBorderInfo?.length) {
+            _sheet.config ||= {};
+            _sheet.config.borderInfo = nextBorderInfo;
+            draft.config.borderInfo = nextBorderInfo;
+            ydocConfigChanges.push({
+              sheetId: draft.currentSheetId,
+              path: ['config', 'borderInfo'],
+              value: nextBorderInfo ?? [],
+              type: 'update',
+            });
+          }
+
+          if (ydocConfigChanges.length > 0) {
+            draft.hooks?.updateCellYdoc?.(ydocConfigChanges);
+          }
 
           // Keep row height metadata in sync with moved row data.
           if (_sheet.config) {
@@ -679,8 +737,9 @@ export const useRowDragAndDrop = (
             }
           }
 
-          // Comments are stored on cell.ps and move with row/column data.
-          // Reset visible comment overlays so positions are recomputed lazily.
+          // Host-owned comment keys (`${sheetId}_${row}_${col}`) do not move
+          // with the splice. Notify after celldata is written to ydoc so the
+          // portal persist is not a half-update (old cells + new anchors).
           draft.commentBoxes = [];
           draft.hoveredCommentBox = undefined;
           draft.editingCommentBox = undefined;
@@ -736,31 +795,23 @@ export const useRowDragAndDrop = (
             context.currentSheetId,
           );
 
-          // Notify Yjs for every cell in the disturbed range (moved row + all rows in between)
-          const cellChanges: {
-            sheetId: string;
-            path: string[];
-            key?: string;
-            value: any;
-            type?: 'update' | 'delete';
-          }[] = [];
-          const numCols = d?.[0]?.length ?? 0;
-          for (let r = affectedRowStart; r <= affectedRowEnd; r += 1) {
-            const row = rows[r];
-            for (let c = 0; c < numCols; c += 1) {
-              const cell = row?.[c];
-              cellChanges.push({
-                sheetId: draft.currentSheetId,
-                path: ['celldata'],
-                value: { r, c, v: cell ?? null },
-                key: `${r}_${c}`,
-                type: 'update',
-              });
-            }
-          }
-          if (cellChanges.length > 0 && draft.hooks?.updateCellYdoc) {
-            draft.hooks.updateCellYdoc(cellChanges);
-          }
+          // Sync sparse celldata for disturbed rows only (skip unchanged empty cells).
+          emitCelldataRangeDiffToYdoc(
+            draft,
+            draft.currentSheetId,
+            rows,
+            affectedRowStart,
+            affectedRowEnd,
+            0,
+            Math.max(0, (rows[0]?.length ?? 1) - 1),
+            ydocBeforePersisted,
+          );
+          notifyCommentAnchorMove(draft, {
+            type: 'row',
+            sheetId: String(_sheet.id ?? draft.currentSheetId),
+            sheetKeys: getSheetCommentKeyPrefixes(_sheet, sheetIdx),
+            indexMap: rowMap,
+          });
           const colLen = d?.[0]?.length || 0;
           const colEnd = Math.max(0, colLen - 1);
           api.setSelection(

@@ -1,7 +1,7 @@
 import numeral from 'numeral';
 import _ from 'lodash';
 import { isRealNum, valueIsError, detectDateFormat } from './validation';
-import { getDateBaseLocale } from './date-base-locale';
+import { getCanonicalDateDisplayFormat } from './date-base-locale';
 // @ts-ignore
 import SSF from './ssf';
 import { Cell, CellMatrix } from '../types';
@@ -361,7 +361,13 @@ export function genarate(value: string | number | boolean) {
       );
       v = datenum_local(dateObj);
       ct.t = 'd';
-
+      // Preserve the typed pattern on auto-input (GSheets-like).
+      // Toolbar Format → Date applies getCanonicalDateDisplayFormat separately.
+      const hasTime =
+        df.hours !== 0 ||
+        df.minutes !== 0 ||
+        df.seconds !== 0 ||
+        /H|h|AM\/PM|T/i.test(df.formatType);
       const map: Record<string, string> = {
         'yyyy-MM-dd': 'yyyy-MM-dd',
         'yyyy-MM-dd HH:mm': 'yyyy-MM-dd HH:mm',
@@ -403,6 +409,8 @@ export function genarate(value: string | number | boolean) {
         'MM-dd-yy': 'mm-dd-yy',
         'M d yyyy': 'm d yyyy',
         'MM dd yyyy': 'mm dd yyyy',
+        'd M yyyy': 'd m yyyy',
+        'dd MM yyyy': 'dd mm yyyy',
         'MM/yyyy': 'mm/yyyy',
         'M/yyyy': 'm/yyyy',
         'MM-yyyy': 'mm-yyyy',
@@ -433,10 +441,8 @@ export function genarate(value: string | number | boolean) {
         'dy dd/MM/yyyy': 'ddd dd/mm/yyyy',
         'dy MM/dd/yyyy': 'ddd mm/dd/yyyy',
       };
-
       ct.fa =
-        map[df.formatType] ||
-        (getDateBaseLocale() === 'us' ? 'MM/dd/yyyy' : 'dd/MM/yyyy');
+        map[df.formatType] || getCanonicalDateDisplayFormat(hasTime);
       m = SSF.format(ct.fa, v);
     } else {
       m = String(value);
@@ -489,7 +495,9 @@ export function isTypedCurrencyDisplayFormat(
     if (fa.includes(`"${c}"`)) return true;
   }
   return getSortedFiatPrefixSymbols(currencyDetail).some(
-    (sym) => fa.startsWith(sym) && /#,##0/.test(fa),
+    (sym) =>
+      (fa.startsWith(sym) || fa.startsWith(quoteSsfLiteral(sym))) &&
+      /#,##0/.test(fa),
   );
 }
 
@@ -570,7 +578,7 @@ export function parseCurrencyPrefixedInput(
       const m = SSF.format(fa, finalV);
       return [m, ctOut, finalV];
     }
-    const fa = `${sym}#,##0`;
+    const fa = buildFiatCurrencyFormat(sym, 0, { spaced: false });
     const ctOut = { fa, t: 'n' };
     const m = SSF.format(fa, finalV);
     return [m, ctOut, finalV];
@@ -589,6 +597,23 @@ export function genarateOrCurrencyPrefixed(
   return genarate(vupdate);
 }
 
+/** Wrap text for SSF/Excel `fa` so letters like M/H/S/d are not date/time tokens (e.g. MXN → 5XN). */
+export function quoteSsfLiteral(text: string): string {
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+/** Build a fiat currency display mask safe for SSF.format (always quotes the symbol). */
+export function buildFiatCurrencyFormat(
+  symbol: string,
+  decimals = 2,
+  options?: { spaced?: boolean },
+): string {
+  const dp = '0'.repeat(Math.max(0, decimals));
+  const mask = decimals > 0 ? `#,##0.${dp}` : '#,##0';
+  const sep = options?.spaced === false ? '' : ' ';
+  return `${quoteSsfLiteral(symbol)}${sep}${mask}`;
+}
+
 export function update(fmt: string, v: any) {
   return SSF.format(fmt, v);
 }
@@ -596,9 +621,39 @@ export function update(fmt: string, v: any) {
 /** Max decimal places for toolbar +/- on General (Auto) without switching to a numeric `fa`. */
 export const MAX_GENERAL_AUTO_DP = 15;
 
+/** Count decimal places currently shown for a General/Auto numeric cell. */
+export function countGeneralDisplayDecimalPlaces(cell: Cell): number {
+  if (typeof cell.m === 'string' && cell.m.includes('.')) {
+    const digits = cell.m.split('.')[1]?.replace(/[^0-9]/g, '') ?? '';
+    return digits.length;
+  }
+  const v = cell.v;
+  if (!isRealNum(v)) return 0;
+  const num = Number(v);
+  if (Number.isInteger(num)) return 0;
+  const auto = formatGeneralAutoDecimalWithTenDigitRule(num);
+  if (auto?.includes('.')) {
+    return auto.split('.')[1].length;
+  }
+  const s = num.toString();
+  if (s.includes('.')) {
+    const frac = s.split('.')[1];
+    return frac.replace(/0+$/, '').length || frac.length;
+  }
+  return 0;
+}
+
+/** Effective decimal places for toolbar +/- (explicit `ct.dp` or inferred from display). */
+export function getEffectiveGeneralDp(cell: Cell): number {
+  if (cell.ct?.dp != null && cell.ct.dp >= 0) {
+    return Math.min(MAX_GENERAL_AUTO_DP, Math.floor(cell.ct.dp));
+  }
+  return countGeneralDisplayDecimalPlaces(cell);
+}
+
 /**
  * Recompute `m` for numeric cells with `fa === "General"`.
- * When `ct.dp` is set (1..MAX), uses fixed decimals like Sheets Auto + decimal buttons.
+ * When `ct.dp` is set (0..MAX), uses fixed decimals like Sheets Auto + decimal buttons.
  * Otherwise uses the usual `genarate` General display.
  */
 export function refreshGeneralNumericDisplay(cell: Cell): void {
@@ -619,7 +674,17 @@ export function refreshGeneralNumericDisplay(cell: Cell): void {
   }
   if (!isRealNum(v)) return;
   const num = Number(v);
-  if (ct.dp != null && ct.dp >= 1) {
+  if (ct.dp != null && ct.dp >= 0) {
+    if (ct.dp === 0) {
+      const s = num.toString();
+      if (s.toLowerCase().includes('e')) {
+        const g = genarate(num);
+        if (g) cell.m = g[0].toString();
+        return;
+      }
+      cell.m = String(Math.round(num));
+      return;
+    }
     const d = Math.min(MAX_GENERAL_AUTO_DP, Math.max(1, Math.floor(ct.dp)));
     const s = num.toString();
     if (s.toLowerCase().includes('e')) {

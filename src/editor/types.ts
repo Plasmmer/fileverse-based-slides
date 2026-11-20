@@ -1,10 +1,29 @@
-import { Sheet, Workbook } from '@sheet-engine/react';
-import { ComponentProps, RefObject } from 'react';
+import { Sheet } from '@sheet-engine/react';
+import { RefObject } from 'react';
 import { WorkbookInstance } from '@sheet-engine/react';
 import * as Y from 'yjs';
 import { Cell } from '@sheet-engine/react';
 import { ERROR_MESSAGES_FLAG } from './constants/shared-constants';
-import { SmartContractQueryHandler } from './utils/after-update-cell';
+import { CollaborationProps } from '../sync-local/types';
+import { CommentsConfig } from './types/comments';
+import type { SmartContractConfig } from './types/smart-contract';
+import type { ApiKeyStorage } from './utils/api-key-storage';
+import type { ThemeKey } from '@sheet-engine/core/theme';
+import type { DSheetContentSnapshot } from '../persistence';
+import type { NavigateToSheetOptions } from './utils/navigate-to-sheet';
+
+export type { ThemeKey } from '@sheet-engine/core/theme';
+
+export type DSheetPermissionMode = 'view' | 'comment' | 'edit';
+
+export type {
+  CommentThread,
+  CommentReply,
+  CommentActionParams,
+  CommentsConfig,
+  CommentAnchorMove,
+} from './types/comments';
+export { CommentAction } from './types/comments';
 
 export interface SheetUpdateData {
   data: Sheet[];
@@ -14,7 +33,39 @@ export interface EditorValues {
   sheetEditorRef: RefObject<WorkbookInstance>;
   currentDataRef: React.MutableRefObject<Sheet[] | null>;
   ydocRef: React.RefObject<Y.Doc | null>;
+  openPanel: (panelId: string) => void; // NEW
+  closePanel: () => void; // NEW
 }
+
+export type DSheetEditorHandle = WorkbookInstance & {
+  refreshIndexedDB: () => Promise<void>;
+  terminateSession: () => void;
+  updateCollaboratorName: (name: string) => void;
+  updateSessionTitle: (args: {
+    encryptedTitle: string;
+    documentTitle: string;
+  }) => void;
+
+  navigateToSheet: (
+    sheetId: string,
+    opts?: NavigateToSheetOptions,
+  ) => Promise<boolean>;
+};
+
+export interface PanelConfig {
+  id: string;
+  header: {
+    title: string;
+    subtitle?: string;
+  };
+  width?: string; // default: '380px'
+  content: React.ReactNode;
+}
+
+export type {
+  PanelId,
+  BuiltInPanelType,
+} from './components/sidebar/use-right-panels';
 
 // Define the onboarding handler type
 export type OnboardingHandlerType = (params: {
@@ -23,39 +74,25 @@ export type OnboardingHandlerType = (params: {
   sheetEditorRef: React.RefObject<WorkbookInstance | null>;
 }) => { row: number; column: number };
 
-// Define the data block API key handler type
-export type DataBlockApiKeyHandlerType = (params: {
-  data: ErrorMessageHandlerReturnType;
-  sheetEditorRef: React.RefObject<WorkbookInstance | null>;
-  executeStringFunction: ({
-    functionCallString,
-    sheetEditorRef,
-    dataBlockRow,
-    dataBlockColumn,
-    handleSmartContractQuery,
-  }: {
-    functionCallString: string;
-    sheetEditorRef: React.RefObject<WorkbookInstance | null>;
-    dataBlockRow: number;
-    dataBlockColumn: number;
-    handleSmartContractQuery: SmartContractQueryHandler;
-  }) => Promise<unknown>;
-  row: number;
-  column: number;
-  newValue: Cell;
-  formulaResponseUiSync: (params: {
-    row: number;
-    column: number;
-    newValue: Record<string, string>;
-    apiData: Array<Record<string, object>>;
-    sheetEditorRef: React.RefObject<WorkbookInstance | null>;
-  }) => void;
-}) => void;
+export type DataBlockEventType =
+  | 'success'
+  | 'error'
+  | 'api-key-required'
+  | 'api-key-saved'
+  | 'retry';
+
+export interface DataBlockEvent {
+  type: DataBlockEventType;
+  functionName?: string;
+  errorType?: string;
+  apiKeyName?: string;
+}
+
+export type { ApiKeyStorage } from './utils/api-key-storage';
 
 export interface DsheetProps {
   isNewSheet: boolean;
   setSelectedTemplate?: React.Dispatch<React.SetStateAction<string>>;
-  setShowSmartContractModal?: React.Dispatch<React.SetStateAction<boolean>>;
   getDocumentTitle?: (dsheetId: string) => Promise<string>;
   updateDocumentTitle?: (title: string) => void;
   isAuthorized: boolean;
@@ -63,41 +100,79 @@ export interface DsheetProps {
   setFetchingURLData?: (fetching: boolean) => void;
   setInputFetchURLDataBlock?: React.Dispatch<React.SetStateAction<string>>;
   renderNavbar?: (editorValues?: EditorValues) => JSX.Element;
+  /** Mount the navbar slot. `renderNavbar` still runs when hidden, so host
+   * side effects inside it keep working. Default true. */
+  showNavbar?: boolean;
+  /** Show the sheet toolbar. Default true. */
+  showToolbar?: boolean;
+  /** Show the formula bar. Default true. */
+  showFormulaBar?: boolean;
   enableIndexeddbSync?: boolean;
   dsheetId: string;
+  /**
+   * Cheap change signal for hosts that persist sheet bodies through Yjs.
+   * Unlike `onChange`, this does not build a plain sheet or encode the Y.Doc.
+   */
+  onContentUpdate?: () => void;
   onChange?: (updateData: SheetUpdateData, encodedUpdate?: string) => void;
+  collaboration?: CollaborationProps;
+  /** Called when local IndexedDB persistence fails. The editor and durable
+   * collaboration continue using the in-memory Y.Doc, matching dDoc. */
+  onIndexedDbError?: (error: Error) => void;
   username?: string;
-  enableWebrtc?: boolean;
   portalContent?: string;
   isReadOnly?: boolean;
+  /** Permission status displayed above the toolbar. When omitted, read-only
+   * sheets retain the existing View/View-and-comment behavior. */
+  permissionMode?: DSheetPermissionMode;
+  /** Called when a read-only consumer asks to elevate to edit mode. The host
+   * owns access proof, loading, errors, and the resulting mode transition. */
+  onEnterEdit?: () => void;
+  /** Called when an invited commenter needs to authenticate before the host can
+   * recover comment capability. */
+  onSignInToComment?: () => void;
+  /** Lets the host toggle a recovered commenter between comment and view mode. */
+  onViewerModeChange?: (mode: 'comment' | 'view') => void;
   allowSheetDownload?: boolean;
   isTemplateOpen?: boolean;
-  isCollaborative?: boolean;
   selectedTemplate?: string;
   onboardingComplete?: boolean;
   /** When `onboardingComplete` is omitted, read `localStorage.getItem(key)==='true'` (default key `onboardingComplete`). */
   onboardingCompleteLocalStorageKey?: string;
   onboardingHandler?: OnboardingHandlerType;
-  dataBlockApiKeyHandler?: DataBlockApiKeyHandlerType;
   setForceSheetRender?: React.Dispatch<React.SetStateAction<number>>;
-  getCommentCellUI?: ComponentProps<typeof Workbook>['getCommentCellUI'];
-  // eslint-disable-next-line @typescript-eslint/ban-types
-  commentData?: Object;
+  commentsConfig?: CommentsConfig;
   toggleTemplateSidebar?: () => void;
-  sheetEditorRef?: RefObject<
-    WorkbookInstance & { refreshIndexedDB: () => Promise<void> }
-  >;
-  storeApiKey?: (apiKeyName: string) => void;
-  allowComments?: boolean;
-  onDataBlockApiResponse?: (dataBlockName: string) => void;
+  /** Legacy ref prop. Standard React refs are also supported. */
+  sheetEditorRef?: React.Ref<DSheetEditorHandle>;
+  /** Override where datablock API keys are stored (default: localStorage). */
+  apiKeyStorage?: ApiKeyStorage;
+  /** Optional lifecycle events for analytics / side-effects. */
+  onDataBlockEvent?: (event: DataBlockEvent) => void;
   onDuneChartEmbed?: () => void;
   onSheetCountChange?: (sheetCount: number) => void;
+  onCopySheetLink?: (args: { sheetId: string; sheetName: string }) => void;
+  /** Fires whenever local content-sync status changes. Host apps should gate
+   * collab start/resume on 'synced' — starting before local content is fully
+   * synced is what let the RTC layer bind to a stale doc in the past. */
+  onContentSyncStatusChange?: (
+    status: 'initializing' | 'syncing' | 'synced' | 'error',
+  ) => void;
+  /** Fires once the first collaboration sync has been reconciled with the
+   * workbook, or when that reconciliation fails. */
+  onCollaborationInitializationComplete?: (result: 'ready' | 'error') => void;
   editorStateRef?: React.MutableRefObject<{
     refreshIndexedDB: () => Promise<void>;
+    getContentSnapshot: () => DSheetContentSnapshot;
+    mergeContent: (encodedState: string) => DSheetContentSnapshot;
   } | null>;
-  handleSmartContractQuery?: SmartContractQueryHandler;
+  /** Smart contract config: execution + UI in package; consumer owns persistence via callbacks. */
+  smartContracts?: SmartContractConfig;
   enableLiveQuery?: boolean;
   liveQueryRefreshRate?: number;
+  customPanels?: PanelConfig[];
+  /** Active theme; drives the canvas/grid palette (chrome themes via the <html> class). */
+  theme?: ThemeKey;
 }
 export type BaseError = {
   message: string;

@@ -18,7 +18,12 @@ export type { Context } from './context';
 
 // settings
 export { defaultSettings } from './settings';
-export type { Settings, Hooks, DateBaseLocale } from './settings';
+export type {
+  Settings,
+  Hooks,
+  DateBaseLocale,
+  CommentAnchorMove,
+} from './settings';
 
 // events
 export {
@@ -40,6 +45,10 @@ export {
   handleRowSizeHandleMouseDown,
   handleColFreezeHandleMouseDown,
   handleRowFreezeHandleMouseDown,
+  describeMatchedShortcut,
+  isBrowserZoomShortcut,
+  isOpenShortcutsModalShortcut,
+  isFormulaListShortcut,
 } from './events';
 
 // locale
@@ -78,6 +87,7 @@ export {
   getRangeRectsByCharacterOffset,
   // date base locale
   getDateBaseLocale,
+  getCanonicalDateDisplayFormat,
   getCanonicalDateEditFormat,
   getDateEditFormatForCell,
   isUsDateBaseLocale,
@@ -90,10 +100,19 @@ export {
   valueShowEs,
   isTypedCurrencyDisplayFormat,
   isCurrencyLikeNumberFormat,
+  buildFiatCurrencyFormat,
+  quoteSsfLiteral,
   // formula
   FormulaCache,
   groupValuesRefresh,
   execFunctionGroup,
+  runFormulaEvalChunk,
+  applyWorkerFormulaChunkResults,
+  isFormulaEvalPending,
+  FORMULA_ASYNC_CHUNK_SIZE,
+  FORMULA_ASYNC_EVAL_THRESHOLD,
+  FORMULA_WORKER_CHUNK_SIZE,
+  FORMULA_WORKER_THRESHOLD,
   setCaretPosition,
   getrangeseleciton,
   getFormulaEditorOwner,
@@ -109,6 +128,11 @@ export {
   setFormulaEditorOwner,
   functionHTMLGenerate,
   suppressFormulaRangeSelectionForInitialEdit,
+  resetFormulaArrowSession,
+  ensureFormulaRangeToSheet,
+  shouldPreserveFormulaEditOnSheetSwitch,
+  activateSheetForNavigation,
+  returnToFormulaOriginSheet,
   rangeSetValue,
   getFormulaRangeIndexForKeyboardSync,
   createFormulaRangeSelect,
@@ -172,6 +196,9 @@ export {
   handleMerge,
   mergeSelectionHasValues,
   handleSort,
+  getRemoveDuplicatesPreview,
+  removeDuplicates,
+  getRemoveDuplicatesErrorMessage,
   handleFreeze,
   handleTextSize,
   handleSum,
@@ -187,6 +214,7 @@ export {
   drawArrow,
   setEditingComment,
   removeEditingComment,
+  removeOverShowComment,
   newComment,
   editComment,
   deleteComment,
@@ -196,6 +224,12 @@ export {
   onCommentBoxMoveStart,
   // image
   removeActiveImage,
+  copyActiveImage,
+  cutActiveImage,
+  pasteImageItem,
+  loadImageFromFile,
+  getImageClipboard,
+  getImageCutSourceId,
   cancelActiveImgItem,
   onImageMoveStart,
   onImageResizeStart,
@@ -242,6 +276,7 @@ export {
   clearFilterForColumn,
   toggleViewerFilter,
   createFilter,
+  applySheetFilterState,
   getFilterColumnValues,
   getFilterColumnColors,
   orderbydatafiler,
@@ -274,7 +309,6 @@ export {
   // zoom
   MAX_ZOOM_RATIO,
   MIN_ZOOM_RATIO,
-  handleKeydownForZoom,
   // refresh
   jfrefreshgrid,
   // iframe
@@ -310,9 +344,25 @@ export {
   execfunction,
   insertUpdateFunctionGroup,
   remapFormulaReferencesByMap,
+  refreshFormulasUsingDefinedNames,
   // ConditionFormat (internal)
   checkCF,
   getComputeMap,
+  // named ranges
+  isValidDefinedNameIdentifier,
+  getDefinedNameDisplayRange,
+  findDefinedNameForSelection,
+  findDefinedNameByName,
+  resolveDefinedNameForFormula,
+  addDefinedName,
+  updateDefinedName,
+  deleteDefinedName,
+  selectDefinedName,
+  openNamedRangesSidebar,
+  scheduleDefinedNamesSync,
+  shiftDefinedNamesOnInsert,
+  shiftDefinedNamesOnDelete,
+  removeDefinedNamesForSheet,
   // toolbar (internal)
   cancelPaintModel,
   // rowcol (internal)
@@ -325,6 +375,7 @@ export type { FilterDate, FilterValue, FilterColor } from './modules';
 // utils
 export {
   getFreezeState,
+  getFrozenPixelBounds,
   toggleFreeze,
   indexToColumnChar,
   escapeScriptTag,
@@ -357,7 +408,16 @@ export type {
   LinkCardProps,
   LiveQueryData,
   Freezen,
+  DefinedName,
 } from './types';
+
+export type {
+  RemoveDuplicatesColumnOption,
+  RemoveDuplicatesError,
+  RemoveDuplicatesOptions,
+  RemoveDuplicatesPreview,
+  RemoveDuplicatesResult,
+} from './modules';
 
 export type {
   CheckModes,

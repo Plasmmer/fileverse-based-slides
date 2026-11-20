@@ -1,6 +1,7 @@
 import _ from 'lodash';
 import { SheetConfig } from './types';
 import { FormulaCache } from './modules';
+import type { FormulaAsyncEvalJob } from './modules/formula-async-eval';
 import { normalizeSelection } from './modules/selection';
 import { DateBaseLocale, Hooks } from './settings';
 import {
@@ -18,6 +19,7 @@ import {
   ConditionRulesProps,
   GlobalCache,
   CellError,
+  DefinedName,
 } from './types';
 import { getSheetIndex } from './utils';
 
@@ -131,6 +133,9 @@ export type Context = {
   currentSheetId: string;
   calculateSheetId: string;
   config: SheetConfig;
+
+  /** Workbook-level named ranges (synced via Yjs `${dsheetId}:definedNames`). */
+  definedNames: DefinedName[];
 
   visibledatarow: number[];
   visibledatacolumn: number[];
@@ -278,6 +283,10 @@ export type Context = {
   defaultCell: Cell;
 
   groupValuesRefreshData: any[];
+  /** Chunked async formula recalc queue (Step 1 perf). Cleared when job completes. */
+  formulaAsyncEval?: FormulaAsyncEvalJob | null;
+  /** True while `formulaAsyncEval` is draining on the main thread in chunks. */
+  isFormulaCalculating?: boolean;
   /**
    * Incremented when formula `func_selectedrange` moves via keyboard (`rangeOfFormula`)
    * so React re-renders — `FormulaCache` is a class and Immer does not track it.
@@ -321,6 +330,7 @@ export function defaultContext(refs: RefValues): Context {
     currentSheetId: '',
     calculateSheetId: '',
     config: {},
+    definedNames: [],
     // 提醒弹窗
     warnDialog: undefined,
     currency: '¥',
@@ -587,6 +597,8 @@ export function defaultContext(refs: RefValues): Context {
     },
 
     groupValuesRefreshData: [],
+    formulaAsyncEval: null,
+    isFormulaCalculating: false,
     formulaRangeNavRevision: 0,
     formulaCache: new FormulaCache(), // class will not be frozen by immer, can be mutated at any time.
     hooks: {},

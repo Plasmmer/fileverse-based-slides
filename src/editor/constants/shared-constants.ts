@@ -25,8 +25,6 @@ export const DEFAULT_SHEET_DATA = [
     celldata: [],
     config: {},
     order: 0,
-    row: 500,
-    column: 26,
   },
 ];
 
@@ -75,8 +73,8 @@ export const CELL_CONTEXT_MENU_ITEMS = [
   'copy',
   'paste',
   '|',
-  'insert-row',
   'insert-row-above',
+  'insert-row',
   'insert-column',
   'insert-column-right',
   'insert-cells',
@@ -114,8 +112,8 @@ export const HEADER_CONTEXT_MENU_ITEMS = [
   'copy',
   'paste',
   '|',
-  'insert-row',
   'insert-row-above',
+  'insert-row',
   'insert-column',
   'insert-column-right',
   '|',

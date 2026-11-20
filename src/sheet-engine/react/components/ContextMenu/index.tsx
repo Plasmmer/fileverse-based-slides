@@ -6,6 +6,7 @@ import {
   deleteRowCol,
   insertRowCol,
   removeActiveImage,
+  cutActiveImage,
   deleteSelectedCellText,
   sortSelection,
   createFilter,
@@ -591,19 +592,13 @@ const ContextMenu: React.FC = () => {
                   draftCtx.contextMenu = {};
                   return;
                 }
-                handleCopy(draftCtx);
-
                 if (draftCtx.activeImg != null) {
-                  removeActiveImage(draftCtx);
+                  // Keep image visible until paste (Excel-style cut)
+                  cutActiveImage(draftCtx);
                 } else {
-                  const msg = deleteSelectedCellText(draftCtx);
-                  if (msg === 'partMC') {
-                    showDialog(generalDialog.partiallyError, 'ok');
-                  } else if (msg === 'allowEdit') {
-                    showDialog(generalDialog.readOnlyError, 'ok');
-                  } else if (msg === 'dataNullError') {
-                    showDialog(generalDialog.dataNullError, 'ok');
-                  }
+                  // Same as Ctrl/Cmd+X: copy + mark cut; clear source on paste
+                  handleCopy(draftCtx);
+                  draftCtx.luckysheet_paste_iscut = true;
                 }
                 jfrefreshgrid(draftCtx, null, undefined);
 
@@ -652,8 +647,11 @@ const ContextMenu: React.FC = () => {
               addRowColRightAvobe('column', 'lefttop');
             }}
           >
-            <div className="context-item">
-              <LocalLucidIcon name="AddColLeft" />
+            <div className="context-item color-text-default">
+              <LocalLucidIcon
+                name="AddColLeft"
+                className="color-text-default"
+              />
               <div>{colLeftLabel}</div>
             </div>
           </Menu>
@@ -675,8 +673,11 @@ const ContextMenu: React.FC = () => {
               addRowColRightAvobe('column', 'rightbottom');
             }}
           >
-            <div className="context-item">
-              <LocalLucidIcon name="AddColRight" />
+            <div className="context-item color-text-default">
+              <LocalLucidIcon
+                name="AddColRight"
+                className="color-text-default"
+              />
               <div>{colRightLabel}</div>
             </div>
           </Menu>
@@ -697,8 +698,11 @@ const ContextMenu: React.FC = () => {
               addRowColRightAvobe('row', 'lefttop');
             }}
           >
-            <div className="context-item">
-              <LocalLucidIcon name="AddRowAboveLocal" />
+            <div className="context-item color-text-default">
+              <LocalLucidIcon
+                name="AddRowAboveLocal"
+                className="color-text-default"
+              />
               <div>{rowAboveLabel}</div>
             </div>
           </Menu>
@@ -720,8 +724,11 @@ const ContextMenu: React.FC = () => {
               addRowColRightAvobe('row', 'rightbottom');
             }}
           >
-            <div className="context-item">
-              <LocalLucidIcon name="AddRowBelowLocal" />
+            <div className="context-item color-text-default">
+              <LocalLucidIcon
+                name="AddRowBelowLocal"
+                className="color-text-default"
+              />
               <div>{rowBelowLabel}</div>
             </div>
           </Menu>
