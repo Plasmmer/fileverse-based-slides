@@ -51,6 +51,7 @@ The exact folder names can change after the engine spike. The architectural sepa
 | Slide engine adapter | Hides the selected canvas/editor engine behind a small application-facing API |
 | Presentation UI | Ribbon, slide navigator, canvas host, format inspector, notes panel, presenter view |
 | PPTX I/O | Import/export workers, OOXML mapping, relationship/media handling, compatibility diagnostics |
+| Embedded version history | libpijul repository lifecycle, version checkpoints, restore, and PPTX OPC extension packaging |
 | Local persistence | Browser-local draft and recovery, isolated from DSheet IndexedDB keys |
 | Collaboration adapter | Connects the presentation model to a selected collaboration provider |
 | Fileverse adapter | Authentication, encrypted updates, presence, commit/storage callbacks, sharing, and document metadata |
@@ -83,6 +84,7 @@ At minimum, account for:
 - Speaker notes and hidden slides.
 - Transitions and animations as separate timeline/resource data.
 - Embedded or linked assets and any unsupported OOXML parts that must survive a round trip.
+- A portable version history carried inside the .pptx file using libpijul, without making the slide content dependent on Pijul-aware applications.
 
 A spreadsheet-style table of cells is not a suitable top-level model for these concepts.
 
@@ -140,9 +142,11 @@ Do not expose disabled or decorative controls as if they work. The ribbon should
 - Choose slide size and background.
 - Undo/redo.
 - Save/reopen local work and export .pptx.
+- Create and restore named version checkpoints using the embedded Pijul history described in [VERSIONING.md](./VERSIONING.md).
 
 ### Later milestones
 
+- Version-history browsing, comparison, named checkpoints, and restore are part of the planned authoring experience. The history must travel inside the .pptx and degrade gracefully in editors that do not understand it; see [VERSIONING.md](./VERSIONING.md).
 - Tables, charts, connectors, and diagram support.
 - Masters, layouts, theme editing, and notes.
 - Transitions, animations, timing, and presenter tools.
