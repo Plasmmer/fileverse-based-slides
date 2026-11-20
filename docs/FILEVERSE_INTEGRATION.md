@@ -130,8 +130,8 @@ For a Vercel deployment:
 7. Do not send plaintext slide content to the collaboration server. Follow the Fileverse client-side encryption protocol.
 8. Treat server-reported permissions and document identity as authoritative; do not rely on frontend-only isAuthorized flags.
 9. Keep local-only, Fileverse-connected, and error states distinguishable.
-11. Keep Pijul version history inside the PPTX file and under the same encryption/access-control boundary as the presentation.
-10. Add regression tests proving that a DSheet document opened by the old app remains a DSheet and that the presentation app rejects a DSheet room, and vice versa.
+10. Keep Pijul version history inside the PPTX file and under the same encryption/access-control boundary as the presentation.
+11. Add regression tests proving that a DSheet document opened by the old app remains a DSheet and that the presentation app rejects a DSheet room, and vice versa.
 
 ## Integration milestones
 
