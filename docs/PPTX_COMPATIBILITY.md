@@ -59,6 +59,12 @@ The importer must follow relationships rather than assume file names or slide nu
 
 A future autosave format may store the editor's native model locally. That local representation is not a replacement for .pptx import/export.
 
+### Embedded Pijul version history
+
+The editor should embed a portable libpijul repository inside the .pptx using a separate OPC part, a declared content type, and a package-root relationship. The repository must track a normalized OOXML projection that excludes its own history payload and the wrapper relationship/content-type entry, preventing recursive self-versioning. See [VERSIONING.md](./VERSIONING.md) for the proposed archive layout, libpijul runtime spike, save/restore lifecycle, and PowerPoint compatibility requirements.
+
+Do not add an unregistered .pijul directory as arbitrary ZIP entries. Unknown OPC relationships are permitted, but PowerPoint and other producers may discard unknown relationship targets when saving. The deck must always remain usable when the history part is absent; preserving the history after external editing is a separately tested capability.
+
 ## Fidelity policy
 
 Do not promise 100% PowerPoint compatibility before it has been measured.
@@ -113,6 +119,8 @@ For every fixture, record expected behavior per feature: editable, preserved but
 ## Required test scenarios
 
 - Import a fixture and export without editing. Compare semantic OOXML content and relationships, not ZIP byte-for-byte equality.
+- Create an embedded Pijul version, export the deck, and verify the OPC relationship and content-type declaration.
+- Open, edit, and re-save the deck in PowerPoint. Verify that the slide content remains valid and separately inspect whether the unknown Pijul relationship and history part survived.
 - Import, change one text run, export, reopen, and verify both the edit and unrelated content.
 - Import, move/resize an image, export, and verify the media relationship still resolves.
 - Import a deck containing unsupported content, edit a supported object, export, and verify preserved parts remain present when safe.
@@ -127,7 +135,7 @@ For every fixture, record expected behavior per feature: editable, preserved but
 - Parse untrusted ZIP/XML input defensively. Enforce file-size and decompressed-size limits.
 - Reject invalid package paths and malformed relationship targets.
 - Avoid loading external links or embedded scripts automatically.
-- Treat embedded objects and external media as untrusted content.
+- Treat embedded objects, external media, and the nested Pijul repository as untrusted content.
 - Revoke object URLs and release image/worker resources when decks close.
 - Do not log document contents, text, images, or decrypted collaboration payloads.
 - Make import/export failures recoverable: never discard the user's source file because conversion failed.
