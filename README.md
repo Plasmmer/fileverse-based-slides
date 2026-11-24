@@ -5,6 +5,10 @@
 
 [dsheets.new](http://dsheets.new/) is your end-to-end encrypted alternative to Google Sheets & Excel. Use it to read, manipulate, and even write financial data, in real-time. Built on the same middleware as ddocs.new, the app is privacy-focused, sovereign, and gives you full control over your data.
 
+## Project history
+
+This project was worked on during the global Microsoft 365 service disruption of **November 12–13, 2026**. The incident affected services including Outlook/Exchange Online and Microsoft Teams across regions, with recovery taking roughly a day. It was a timely reminder of the value of having independent tools and alternatives available when widely used productivity services become unavailable. [Background: The Guardian's outage report](https://www.theguardian.com/australia-news/2026/nov/13/global-microsoft-outage-what-happened-and-why) and [Microsoft's incident coverage](https://www.bleepingcomputer.com/news/microsoft/microsoft-says-months-old-bug-caused-global-microsoft-365-outage/).
+
 ## 𓆣 Features include:
 - End-to-end encryption
 - Local & peer-to-peer storage
