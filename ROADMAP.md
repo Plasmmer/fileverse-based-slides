@@ -10,6 +10,10 @@ This roadmap tracks ideas for the experimental presentation editor and adjacent 
   - Explore project data that can represent menu pages, button focus states, directional remote-control navigation, title/chapter destinations, audio/subtitle selection, and return-to-menu behavior.
   - Investigate export pipelines for standards-compliant disc structures and ISO images. Treat encoding, menu rendering, disc authoring, and burning as separate stages.
   - Keep the first milestone focused on designing and previewing menus; actual disc authoring/export can follow once the target formats and toolchain are validated.
+  - Use a portable, versioned declarative project as the handoff between the web editor and a native desktop authoring app. The native app must reopen and continue editing the project, not merely burn a flattened export.
+  - Add target-aware compatibility feedback in both editor controls and on affected slide/menu objects. Distinguish supported, converted/degraded, and unsupported behavior; explain the reason and offer replace, flatten, pre-render, rebuild, keep web/native-only, or remove workflows.
+  - Document DVD-Video constraints around SD video modes, subpicture/button graphics, pre-rendered motion menus, remote-control focus/navigation, limited DVD VM commands, and the lack of a browser runtime for JavaScript, web embeds, and arbitrary minigames.
+  - Keep DVD-Video and Blu-ray capability profiles separate. Blu-ray HDMV and BD-J must not be presented as automatic extensions of DVD menus.
 
 ## Research notes: JavaScript / Node.js ecosystem
 
